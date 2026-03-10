@@ -1356,26 +1356,27 @@ def handle_callback(call):
     if data.startswith("pay_stars_"):
         plan_key = data.replace("pay_stars_", "")
         plans = {
-            "30":      (PRICE_STARS, "Подписка на 30 дней"),
-            "90":      (200,         "Подписка на 90 дней"),
-            "forever": (500,         "Бессрочная подписка"),
+            "30":      (PRICE_STARS, "30 дней"),
+            "90":      (200,         "90 дней"),
+            "forever": (500,         "Навсегда"),
         }
         if plan_key not in plans:
             bot.answer_callback_query(call.id); return
-        amount, title = plans[plan_key]
+        amount, label = plans[plan_key]
         bot.answer_callback_query(call.id)
-        try:
-            bot.send_invoice(
-                uid,
-                title=title,
-                description=f"Доступ к боту {BOT_NAME} — {title}",
-                payload=f"sub_{plan_key}",
-                provider_token="",
-                currency="XTR",
-                prices=[types.LabeledPrice(label=title, amount=amount)],
-            )
-        except Exception as e:
-            bot.send_message(uid, f"😔 Ошибка при создании счёта. Напиши @tronqx\n\n{e}")
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("💬 Написать @tronqx", url="https://t.me/tronqx"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="btn_pay_stars"),
+        )
+        bot.send_message(uid,
+            f"⭐ Подписка: {label} — {amount} Telegram Stars\n\n"
+            f"Как оплатить:\n\n"
+            f"1️⃣ Напиши @tronqx:\n"
+            f"    Подписка {label}, мой ID: {uid}\n\n"
+            f"2️⃣ Отправь {amount} Stars через Telegram\n"
+            f"3️⃣ После оплаты доступ активируется 🌸",
+            reply_markup=kb)
         return
 
     # ── МОЙ АККАУНТ ──
@@ -2429,4 +2430,4 @@ print(f"⭐ Стоимость: {PRICE_STARS} Telegram Stars")
 print(f"⏰ Планировщик напоминаний: активен")
 print(f"🎵 {voice_status}")
 log_event("Bot started v2.0 Redis")
-bot.infinity_polling(timeout=30, long_polling_timeout=20)  
+bot.infinity_polling(timeout=30, long_polling_timeout=20)
