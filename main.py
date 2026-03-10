@@ -10,8 +10,6 @@
 ✅ Дневник настроения
 ✅ Голосовые ответы
 ✅ Анализ фото и задач
-
-Установка: pip install pyTelegramBotAPI gtts
 """
 
 import telebot
@@ -23,12 +21,14 @@ import base64
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime
 from urllib.parse import quote
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN = "8582531187:AAEH94WlDJgUhqb_VwnRPNFqQ49aXPuLWM0"
-GROQ_KEY       = "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"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GROQ_KEY       = os.environ.get("GROQ_KEY", "")
 # ══════════════════════════════════════════════
 
 BOT_NAME  = "Лия"
@@ -36,7 +36,7 @@ USER_NAME = "Солнышко"
 
 MODEL_TEXT      = "llama-3.3-70b-versatile"
 MODEL_VISION    = "meta-llama/llama-4-scout-17b-16e-instruct"
-MODEL_WHISPER   = "whisper-large-v3-turbo"  # для расшифровки голоса
+MODEL_WHISPER   = "whisper-large-v3-turbo"
 
 SYSTEM_PROMPT = f"""Ты — дружелюбная и умная AI-подруга по имени {BOT_NAME}.
 Ты общаешься с девушкой по имени {USER_NAME}.
@@ -50,7 +50,7 @@ modes       = {}
 mood_log    = {}
 todo_list   = {}
 last_answer = {}
-quiz_state  = {}   # { uid: {question, answer, score, total} }
+quiz_state  = {}
 MAX_HISTORY = 20
 
 try:
@@ -120,6 +120,24 @@ MOOD_EMOJIS = {
 }
 
 # ══════════════════════════════════════════════
+#  ВЕБ-СЕРВЕР (чтобы Render не убивал бота)
+# ══════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Liya bot is running!")
+    def log_message(self, *args):
+        pass
+
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+threading.Thread(target=run_server, daemon=True).start()
+
+# ══════════════════════════════════════════════
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ══════════════════════════════════════════════
 
@@ -130,7 +148,7 @@ def get_greeting():
     if 17 <= h < 22: return "🌆 Добрый вечер"
     return "🌙 Не спишь"
 
-def get_history(uid): 
+def get_history(uid):
     if uid not in histories: histories[uid] = []
     return histories[uid]
 
@@ -182,7 +200,6 @@ def ask_ai(uid, user_text, image_b64=None, custom_system=None):
     return answer
 
 def transcribe_voice(file_bytes, filename="voice.ogg"):
-    """Расшифровка голосового через Groq Whisper."""
     r = requests.post(
         "https://api.groq.com/openai/v1/audio/transcriptions",
         headers={"Authorization": f"Bearer {GROQ_KEY}"},
@@ -240,7 +257,6 @@ def send_voice(chat_id, text):
         return False
 
 def make_quiz_question(uid, topic):
-    """Генерирует вопрос для викторины."""
     topic_names = {v: k for k, v in QUIZ_TOPICS.items()}
     topic_label = topic_names.get(topic, "случайная тема")
     prompt = (
@@ -444,7 +460,6 @@ def handle_callback(call):
     uid  = call.from_user.id
     data = call.data
 
-    # ── Режимы ──
     if data.startswith("mode_"):
         m = data.replace("mode_", "")
         modes[uid] = m
@@ -477,7 +492,6 @@ def handle_callback(call):
         bot.send_chat_action(uid, "typing")
         bot.send_message(uid, get_currency(), parse_mode="Markdown")
 
-    # ── Картинка ──
     elif data == "btn_imagine":
         bot.answer_callback_query(call.id)
         modes[uid] = "imagine_mode"
@@ -494,7 +508,6 @@ def handle_callback(call):
         bot.answer_callback_query(call.id, "Рисую...")
         _generate_and_send(call.message.chat.id, uid, prompt)
 
-    # ── ВИКТОРИНА ──
     elif data == "btn_quiz":
         bot.answer_callback_query(call.id)
         state = quiz_state.get(uid, {})
@@ -523,7 +536,7 @@ def handle_callback(call):
 
             kb = types.InlineKeyboardMarkup(row_width=2)
             kb.add(
-                types.InlineKeyboardButton("💡 Подсказка",    callback_data="quiz_hint"),
+                types.InlineKeyboardButton("💡 Подсказка",      callback_data="quiz_hint"),
                 types.InlineKeyboardButton("✅ Показать ответ", callback_data="quiz_answer"),
             )
             kb.add(types.InlineKeyboardButton("➡️ Другой вопрос", callback_data=f"quiz_start_{topic}"))
@@ -539,7 +552,7 @@ def handle_callback(call):
                 reply_markup=kb
             )
             modes[uid] = "quiz_answer_mode"
-        except Exception as e:
+        except Exception:
             try: bot.delete_message(uid, wait.message_id)
             except: pass
             bot.send_message(uid, "😔 Не смогла придумать вопрос. Попробуй другую тему!")
@@ -547,29 +560,23 @@ def handle_callback(call):
     elif data == "quiz_hint":
         bot.answer_callback_query(call.id)
         q = quiz_state.get(uid, {}).get("current", {})
-        hint = q.get("hint", "Подсказок нет 🤷")
-        bot.send_message(uid, f"💡 *Подсказка:*\n\n{hint}", parse_mode="Markdown")
+        bot.send_message(uid, f"💡 *Подсказка:*\n\n{q.get('hint', 'Подсказок нет 🤷')}", parse_mode="Markdown")
 
     elif data == "quiz_answer":
         bot.answer_callback_query(call.id)
-        q = quiz_state.get(uid, {}).get("current", {})
+        q      = quiz_state.get(uid, {}).get("current", {})
         answer = q.get("answer", "?")
         fact   = q.get("fun_fact", "")
         topic  = quiz_state.get(uid, {}).get("topic", "random")
-
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
-            types.InlineKeyboardButton("✅ Я знала!",    callback_data="quiz_correct"),
-            types.InlineKeyboardButton("❌ Не знала",   callback_data="quiz_wrong"),
+            types.InlineKeyboardButton("✅ Я знала!",          callback_data="quiz_correct"),
+            types.InlineKeyboardButton("❌ Не знала",          callback_data="quiz_wrong"),
         )
         kb.add(types.InlineKeyboardButton("➡️ Следующий вопрос", callback_data=f"quiz_start_{topic}"))
-
         bot.send_message(uid,
-            f"✅ *Правильный ответ:*\n\n*{answer}*\n\n"
-            f"🌟 *Интересный факт:*\n{fact}",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
+            f"✅ *Правильный ответ:*\n\n*{answer}*\n\n🌟 *Интересный факт:*\n{fact}",
+            parse_mode="Markdown", reply_markup=kb)
         modes[uid] = "normal"
 
     elif data in ("quiz_correct", "quiz_wrong"):
@@ -581,7 +588,6 @@ def handle_callback(call):
             bot.answer_callback_query(call.id, "😔 Ничего, в следующий раз!")
             bot.send_message(uid, f"💪 Ничего, ты узнала что-то новое! Счёт: {quiz_state.get(uid,{}).get('score',0)}/{quiz_state.get(uid,{}).get('total',0)}")
 
-    # ── Пересказ текста ──
     elif data == "btn_summarize":
         bot.answer_callback_query(call.id)
         modes[uid] = "summarize_mode"
@@ -590,10 +596,8 @@ def handle_callback(call):
             "Отправь любой текст — статью, сообщение, задание — "
             "я сделаю краткий пересказ с главными мыслями! ✨\n\n"
             "_Просто вставь текст следующим сообщением_",
-            parse_mode="Markdown"
-        )
+            parse_mode="Markdown")
 
-    # ── Гороскоп ──
     elif data == "btn_horoscope":
         bot.answer_callback_query(call.id)
         bot.send_message(uid, "🌙 Выбери знак зодиака:", reply_markup=zodiac_keyboard())
@@ -618,7 +622,6 @@ def handle_callback(call):
         except Exception:
             bot.send_message(uid, "😔 Не смогла прочитать звёзды. Попробуй позже.")
 
-    # ── Уход ──
     elif data == "btn_beauty":
         bot.answer_callback_query(call.id)
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -657,7 +660,6 @@ def handle_callback(call):
         except Exception:
             bot.send_message(uid, "😔 Ошибка. Попробуй позже.")
 
-    # ── Песня ──
     elif data == "btn_song":
         bot.answer_callback_query(call.id)
         modes[uid] = "song_mode"
@@ -666,7 +668,6 @@ def handle_callback(call):
             "• По словам из текста\n• По описанию клипа\n• По настроению",
             parse_mode="Markdown")
 
-    # ── Любовные письма ──
     elif data == "btn_love":
         bot.answer_callback_query(call.id)
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -706,7 +707,6 @@ def handle_callback(call):
         except Exception:
             bot.send_message(uid, "😔 Ошибка. Попробуй позже.")
 
-    # ── Список дел ──
     elif data == "btn_todo":
         bot.answer_callback_query(call.id)
         todos = todo_list.get(uid, [])
@@ -735,7 +735,6 @@ def handle_callback(call):
                 bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=todo_keyboard(uid))
             except: pass
 
-    # ── Рецепт ──
     elif data == "btn_recipe":
         bot.answer_callback_query(call.id)
         modes[uid] = "recipe_mode"
@@ -744,7 +743,6 @@ def handle_callback(call):
             "_'яйца, сыр, помидоры'_\n_'курица, картошка, лук'_",
             parse_mode="Markdown")
 
-    # ── Медитация ──
     elif data == "btn_meditation":
         bot.answer_callback_query(call.id)
         bot.send_message(uid, "🧘 Выбери практику:", reply_markup=meditation_keyboard())
@@ -761,7 +759,6 @@ def handle_callback(call):
         bot.send_message(uid, f"*{med['name']}*\n\n{med['text']}",
                         parse_mode="Markdown", reply_markup=kb)
 
-    # ── Настроение ──
     elif data == "btn_mood":
         bot.answer_callback_query(call.id)
         bot.send_message(uid, "Как ты себя чувствуешь? 🌈", reply_markup=mood_keyboard())
@@ -792,7 +789,6 @@ def handle_callback(call):
             lines = [f"{e['time']} — {e['mood']} {e['name']}" for e in log[-10:]]
             bot.send_message(uid, "📊 *Последние записи:*\n\n" + "\n".join(lines), parse_mode="Markdown")
 
-    # ── Голос ──
     elif data == "btn_voice_last":
         text = last_answer.get(uid, "")
         if not text:
@@ -815,7 +811,7 @@ def handle_callback(call):
             parse_mode="Markdown")
 
 # ══════════════════════════════════════════════
-#  ГОЛОСОВЫЕ СООБЩЕНИЯ 🎤
+#  ГОЛОСОВЫЕ СООБЩЕНИЯ
 # ══════════════════════════════════════════════
 
 @bot.message_handler(content_types=["voice"])
@@ -827,25 +823,20 @@ def handle_voice(msg):
         file_info = bot.get_file(msg.voice.file_id)
         file_url  = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
         audio     = requests.get(file_url, timeout=20).content
-
         text = transcribe_voice(audio)
         bot.delete_message(uid, wait.message_id)
-
         bot.send_message(uid, f"🎤 *Ты сказала:*\n_{text}_", parse_mode="Markdown")
-
-        # Отвечаем на распознанный текст как на обычное сообщение
         bot.send_chat_action(uid, "typing")
         answer = ask_ai(uid, text)
         last_answer[uid] = answer
         bot.send_message(uid, answer, reply_markup=after_message_kb())
-
-    except Exception as e:
+    except Exception:
         try: bot.delete_message(uid, wait.message_id)
         except: pass
         bot.reply_to(msg, "😔 Не смогла расшифровать голосовое. Попробуй написать текстом.")
 
 # ══════════════════════════════════════════════
-#  ФОТО 📸
+#  ФОТО
 # ══════════════════════════════════════════════
 
 @bot.message_handler(content_types=["photo"])
@@ -869,7 +860,7 @@ def handle_photo(msg):
         bot.reply_to(msg, "😔 Не смогла обработать фото. Попробуй ещё раз.")
 
 # ══════════════════════════════════════════════
-#  ТЕКСТ 💬
+#  ТЕКСТ
 # ══════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
@@ -879,7 +870,6 @@ def handle_text(msg):
     current_mode = modes.get(uid, "normal")
     bot.send_chat_action(msg.chat.id, "typing")
 
-    # ── Специальные режимы ──
     if current_mode == "imagine_mode":
         modes[uid] = "normal"
         _generate_and_send(msg.chat.id, uid, text, msg)
@@ -892,11 +882,10 @@ def handle_text(msg):
 
     if current_mode == "quiz_answer_mode":
         q = quiz_state.get(uid, {}).get("current", {})
-        correct = q.get("answer", "").lower().strip()
+        correct  = q.get("answer", "").lower().strip()
         user_ans = text.lower().strip()
-        topic = quiz_state.get(uid, {}).get("topic", "random")
+        topic    = quiz_state.get(uid, {}).get("topic", "random")
         modes[uid] = "normal"
-
         if correct and (correct in user_ans or user_ans in correct):
             quiz_state[uid]["score"] = quiz_state.get(uid, {}).get("score", 0) + 1
             score = quiz_state[uid]["score"]
@@ -906,24 +895,22 @@ def handle_text(msg):
                 types.InlineKeyboardButton("➡️ Следующий", callback_data=f"quiz_start_{topic}"),
                 types.InlineKeyboardButton("📋 Меню",      callback_data="btn_menu"),
             )
-            fact = q.get("fun_fact", "")
             bot.reply_to(msg,
-                f"🎉 *Правильно!* Счёт: {score}/{total}\n\n🌟 {fact}",
+                f"🎉 *Правильно!* Счёт: {score}/{total}\n\n🌟 {q.get('fun_fact','')}",
                 parse_mode="Markdown", reply_markup=kb)
         else:
             kb = types.InlineKeyboardMarkup(row_width=2)
             kb.add(
-                types.InlineKeyboardButton("✅ Показать ответ",  callback_data="quiz_answer"),
-                types.InlineKeyboardButton("➡️ Следующий",      callback_data=f"quiz_start_{topic}"),
+                types.InlineKeyboardButton("✅ Показать ответ", callback_data="quiz_answer"),
+                types.InlineKeyboardButton("➡️ Следующий",     callback_data=f"quiz_start_{topic}"),
             )
-            bot.reply_to(msg, "🤔 Не совсем... Попробуй ещё раз или посмотри ответ 👇",
-                        reply_markup=kb)
+            bot.reply_to(msg, "🤔 Не совсем... Попробуй ещё раз или посмотри ответ 👇", reply_markup=kb)
             modes[uid] = "quiz_answer_mode"
         return
 
     if current_mode == "song_mode":
         modes[uid] = "normal"
-        text = f"Пользователь описывает песню: '{text}'. Угадай название и исполнителя. Если не уверена — предложи варианты."
+        text = f"Пользователь описывает песню: '{text}'. Угадай название и исполнителя."
 
     if current_mode == "recipe_mode":
         modes[uid] = "normal"
@@ -935,13 +922,12 @@ def handle_text(msg):
         todo_list[uid].append({"text": text, "done": False})
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
-            types.InlineKeyboardButton("➕ Ещё", callback_data="todo_add"),
+            types.InlineKeyboardButton("➕ Ещё",     callback_data="todo_add"),
             types.InlineKeyboardButton("📝 Список", callback_data="btn_todo"),
         )
         bot.reply_to(msg, f"✅ Добавила: *{text}*", parse_mode="Markdown", reply_markup=kb)
         return
 
-    # ── Обычный чат ──
     try:
         answer = ask_ai(uid, text)
         last_answer[uid] = answer
@@ -961,7 +947,7 @@ def handle_text(msg):
             bot.reply_to(msg, "😔 Что-то пошло не так... Попробуй /new")
 
 # ══════════════════════════════════════════════
-voice_status = "✅ ГОЛОС ВКЛ" if VOICE_ENABLED else "❌ ГОЛОС ВЫКЛ (pip install gtts)"
+voice_status = "✅ ГОЛОС ВКЛ" if VOICE_ENABLED else "❌ ГОЛОС ВЫКЛ"
 print(f"👑 Бот '{BOT_NAME}' LEGENDARY VERSION запущен!")
 print(f"🧠 Викторина: ВКЛ | 🎤 Расшифровка голоса: ВКЛ | 📖 Пересказ: ВКЛ")
 print(f"🎨 Генерация фото: ВКЛ | 🌙 Гороскоп: ВКЛ | 💌 Письма: ВКЛ")
