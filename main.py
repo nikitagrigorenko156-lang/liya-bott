@@ -38,7 +38,7 @@ USER_NAME       = "Солнышко"
 PRICE_STARS     = 100
 PRICE_RUB       = "99 рублей"
 PAYMENT_LINK    = "https://t.me/tronqx"
-TRIAL_DAYS      = 2
+TRIAL_DAYS      = 3
 FREE_MSG_LIMIT  = 10
 DAILY_MSG_LIMIT = 999
 FREE_DAILY_LIMIT= 20
@@ -165,38 +165,52 @@ class DataStore:
         return self.r.get(f"user:{uid}")
 
     def set_user(self, uid, expires, plan="paid"):
+        uid = str(uid).strip()
+        if isinstance(expires, datetime):
+            expires_str = expires.isoformat()
+        elif expires is None:
+            expires_str = None
+        else:
+            expires_str = str(expires).strip()
         data = {
-            "expires": expires.isoformat() if isinstance(expires, datetime) else expires,
+            "expires": expires_str,
             "plan": plan
         }
         self.r.set(f"user:{uid}", data)
-        self.r.sadd("paid_uids", str(uid))
+        self.r.sadd("paid_uids", uid)
+        log_event(f"set_user uid={uid} plan={plan} expires={expires_str}")
 
     def remove_user(self, uid):
         self.r.delete(f"user:{uid}")
         self.r.srem("paid_uids", str(uid))
 
     def has_access(self, uid, username=""):
-        uid = str(uid)
+        uid = str(uid).strip()
         if username and username.lower().lstrip("@") in VIP_USERNAMES:
             return True
         if self.is_blocked(uid):
             return False
         u = self.get_user(uid)
         if not u:
+            log_event(f"has_access: no user data for uid={uid}")
             return False
         expires = u.get("expires")
         if expires is None:
             return True
         try:
+            # Убираем возможные лишние символы из даты
+            expires = str(expires).strip().strip('"')
             exp_dt = datetime.fromisoformat(expires)
             if datetime.now() < exp_dt:
                 return True
             else:
+                log_event(f"has_access: subscription expired for uid={uid}")
                 self.remove_user(uid)
                 return False
-        except Exception:
-            return False
+        except Exception as e:
+            log_event(f"has_access error uid={uid}: {e}, expires={expires}")
+            # Если дата сломана — считаем что доступ есть (не наказываем пользователя)
+            return True
 
     def sub_status(self, uid):
         uid = str(uid)
@@ -584,6 +598,52 @@ def check_daily_limit(uid, username=""):
         return count < FREE_DAILY_LIMIT, count, FREE_DAILY_LIMIT
     return True, count, DAILY_MSG_LIMIT
 
+def clean_latex(text):
+    """Убирает LaTeX разметку и заменяет на обычный текст."""
+    import re
+    # $$...$$ -> просто текст
+    text = re.sub(r'\$\$(.+?)\$\$', lambda m: m.group(1).strip(), text, flags=re.DOTALL)
+    # $...$ -> просто текст
+    text = re.sub(r'\$(.+?)\$', lambda m: m.group(1).strip(), text)
+    # \frac{a}{b} -> a/b
+    text = re.sub(r'\\frac\{([^}]+)\}\{([^}]+)\}', r'\1/\2', text)
+    # \sqrt{x} -> √(x)
+    text = re.sub(r'\\sqrt\{([^}]+)\}', r'√(\1)', text)
+    text = re.sub(r'\\sqrt', '√', text)
+    # \cdot -> ×
+    text = re.sub(r'\\cdot', '×', text)
+    # \left( \right) -> скобки
+    text = re.sub(r'\\left\(', '(', text)
+    text = re.sub(r'\\right\)', ')', text)
+    text = re.sub(r'\\left\[', '[', text)
+    text = re.sub(r'\\right\]', ']', text)
+    # ^{...} -> ^...
+    text = re.sub(r'\^\{([^}]+)\}', r'^\1', text)
+    # _{...} -> _...
+    text = re.sub(r'_\{([^}]+)\}', r'_\1', text)
+    # Греческие буквы
+    greek = {
+        'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ',
+        'epsilon': 'ε', 'theta': 'θ', 'lambda': 'λ', 'mu': 'μ',
+        'pi': 'π', 'sigma': 'σ', 'phi': 'φ', 'omega': 'ω',
+        'Alpha': 'Α', 'Beta': 'Β', 'Gamma': 'Γ', 'Delta': 'Δ',
+        'Pi': 'Π', 'Sigma': 'Σ', 'Omega': 'Ω',
+    }
+    for eng, sym in greek.items():
+        text = text.replace('\\' + eng, sym)
+    # Убираем \dfrac \cfrac и похожее
+    text = re.sub(r'\\[dc]?frac\{([^}]+)\}\{([^}]+)\}', r'\1/\2', text)
+    # Убираем оставшиеся \ команды типа \quad \text и т.д.
+    text = re.sub(r'\\[a-zA-Z]+\s?', '', text)
+    # Убираем одиночные { }
+    text = re.sub(r'(?<![a-zA-Zа-яА-Я0-9])\{|\}(?![a-zA-Zа-яА-Я0-9])', '', text)
+    # Убираем #### заголовки
+    text = re.sub(r'#{2,6}\s*', '', text)
+    # Лишние пробелы и пустые строки
+    text = re.sub(r'  +', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 def ask_ai(uid, user_text, image_b64=None, custom_system=None):
     history = get_history(uid)
     sys = custom_system or mode_system(uid)
@@ -613,6 +673,7 @@ def ask_ai(uid, user_text, image_b64=None, custom_system=None):
     if "error" in data:
         raise Exception(data["error"].get("message", "Ошибка API"))
     answer = data["choices"][0]["message"]["content"].strip()
+    answer = clean_latex(answer)
     if not image_b64:
         history.append({"role": "assistant", "content": answer})
     return answer
@@ -1461,12 +1522,16 @@ def handle_callback(call):
             return
         exp = datetime.now() + timedelta(days=TRIAL_DAYS)
         db.set_user(uid, exp, plan="trial")
+        log_event(f"Trial activated: uid={uid} username={username} expires={exp.isoformat()}")
+        # Сразу проверяем что записалось
+        check = db.has_access(uid, username)
+        log_event(f"Trial check after set: {check}")
         bot.send_message(uid,
             f"🎁 Пробный период активирован!\n\n"
             f"✅ {TRIAL_DAYS} дня бесплатно\n"
             f"📊 Лимит: {FREE_DAILY_LIMIT} сообщений/день\n"
             f"⏰ Действует до: {exp.strftime('%d.%m.%Y')}\n\n"
-            f"Нажми /start чтобы начать! 🌸",
+            f"Теперь все функции доступны! 🌸",
             reply_markup=main_menu_keyboard(username))
         notify_admin(f"🎁 Пробный период: {uid} @{username}")
         return
