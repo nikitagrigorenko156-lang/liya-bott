@@ -47,16 +47,30 @@ LOG_FILE        = "/tmp/liya_log.txt"
 VIP_USERNAMES   = {"tronqx", "dhl1929"}
 ADMIN_USERNAMES = {"tronqx"}
 
-MODEL_TEXT    = "llama-3.3-70b-versatile"
+MODEL_TEXT    = "meta-llama/llama-4-scout-17b-16e-instruct"
 MODEL_VISION  = "meta-llama/llama-4-scout-17b-16e-instruct"
 MODEL_WHISPER = "whisper-large-v3-turbo"
 
-SYSTEM_PROMPT = f"""Ты — дружелюбная и умная AI-подруга по имени {BOT_NAME}.
-Ты общаешься с девушкой по имени {USER_NAME}.
-Характер: тёплая, заботливая, умная, с лёгким юмором.
-Эмодзи используешь уместно. Отвечаешь по-русски как настоящая подруга.
-ВАЖНО: Пиши просто и понятно, без лишних технических терминов.
-Когда присылают фото с задачей — решай подробно и по шагам."""
+SYSTEM_PROMPT = f"""Ты — Лия, лучшая AI-подруга и умный помощник.
+Характер: тёплая, заботливая, умная, с лёгким юмором. Общаешься на русском.
+Эмодзи используешь уместно — не переспамь ими.
+
+ФОРМАТИРОВАНИЕ (очень важно):
+- Используй жирный текст через *текст* для важных моментов
+- Используй списки через • для перечислений
+- Разбивай длинные ответы на абзацы с отступами
+- Математику пиши обычным текстом: 1/2, √4, x², sin(x)
+- НИКОГДА не используй LaTeX ($, $$, \\frac, \\sqrt)
+- Пиши красиво и структурированно как ChatGPT
+
+СПОСОБНОСТИ:
+- Решаешь любые задачи: математика, физика, химия, история, программирование
+- Пишешь код на любом языке с объяснениями  
+- Анализируешь фото и решаешь задачи с фото
+- Ищешь информацию и даёшь актуальные ответы
+- Помогаешь с учёбой, работой, творчеством
+
+При решении задач — пиши каждый шаг на новой строке, подробно и понятно."""
 
 
 # ══════════════════════════════════════════════
@@ -261,6 +275,34 @@ class DataStore:
             st["name"]     = name
             self.r.set(f"stats:{uid}", st)
             return False
+
+    def save_user_memory(self, uid, key, value):
+        """Сохраняет личную информацию о пользователе."""
+        uid = str(uid)
+        mem = self.r.get(f"memory:{uid}") or {}
+        mem[key] = value
+        mem["updated"] = datetime.now().isoformat()
+        self.r.set(f"memory:{uid}", mem)
+
+    def get_user_memory(self, uid):
+        """Получает личную информацию о пользователе."""
+        return self.r.get(f"memory:{uid}") or {}
+
+    def get_memory_context(self, uid):
+        """Возвращает строку с памятью для системного промпта."""
+        mem = self.get_user_memory(uid)
+        if not mem:
+            return ""
+        parts = []
+        if mem.get("name"):       parts.append(f"Имя пользователя: {mem['name']}")
+        if mem.get("age"):        parts.append(f"Возраст: {mem['age']}")
+        if mem.get("birthday"):   parts.append(f"День рождения: {mem['birthday']}")
+        if mem.get("city"):       parts.append(f"Город: {mem['city']}")
+        if mem.get("interests"):  parts.append(f"Интересы: {mem['interests']}")
+        if mem.get("about"):      parts.append(f"О себе: {mem['about']}")
+        if not parts:
+            return ""
+        return "\n\nЧто ты знаешь о пользователе:\n" + "\n".join(parts)
 
     def get_analytics(self):
         all_uids   = self.r.smembers("all_uids")
@@ -510,10 +552,14 @@ def get_mode(uid): return modes.get(uid, "normal")
 
 def mode_system(uid):
     base = SYSTEM_PROMPT
+    # Добавляем память о пользователе
+    memory_ctx = db.get_memory_context(uid)
+    if memory_ctx:
+        base = base + memory_ctx
     m = get_mode(uid)
-    if m == "study":    return base + "\nРежим УЧЁБЫ: объясняй по шагам, просто и понятно."
-    if m == "support":  return base + "\nРежим ПОДДЕРЖКИ: будь особенно нежной и заботливой."
-    if m == "creative": return base + "\nРежим ТВОРЧЕСТВА: предлагай необычные идеи."
+    if m == "study":    return base + "\n\nРежим УЧЁБЫ: объясняй по шагам, просто и понятно. Используй примеры."
+    if m == "support":  return base + "\n\nРежим ПОДДЕРЖКИ: будь особенно нежной и заботливой. Поддерживай и вдохновляй."
+    if m == "creative": return base + "\n\nРежим ТВОРЧЕСТВА: предлагай необычные нестандартные идеи. Думай за рамками."
     return base
 
 def mode_name(uid):
@@ -583,23 +629,52 @@ def transcribe_voice(file_bytes, filename="voice.ogg"):
         return r.text.strip()
     raise Exception(f"Whisper error {r.status_code}")
 
-def generate_image(prompt_ru):
+def translate_to_english(text):
+    """Переводит текст на английский для промпта картинки."""
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            data=json.dumps({"model": MODEL_TEXT,
-                "messages": [{"role": "user", "content": f"Translate to English for image generation (only translation): {prompt_ru}"}],
-                "max_tokens": 100}),
+            data=json.dumps({"model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": f"Translate to English for image generation, respond with translation only, no explanations: {text}"}],
+                "max_tokens": 150}),
             timeout=15
         )
-        prompt_en = r.json()["choices"][0]["message"]["content"].strip()
+        return r.json()["choices"][0]["message"]["content"].strip()
     except Exception:
-        prompt_en = prompt_ru
-    image_url = f"https://image.pollinations.ai/prompt/{quote(prompt_en)}?width=768&height=768&nologo=true"
-    img_r = requests.get(image_url, timeout=45)
-    if img_r.status_code == 200:
-        return img_r.content
+        return text
+
+def generate_image(prompt_ru):
+    """Генерирует картинку через Pollinations.ai с несколькими моделями."""
+    prompt_en = translate_to_english(prompt_ru)
+    
+    # Список моделей для перебора
+    models = ["flux", "flux-realism", "turbo", "flux-anime"]
+    
+    for model in models:
+        try:
+            seed = random.randint(1, 999999)
+            image_url = (
+                f"https://image.pollinations.ai/prompt/{quote(prompt_en)}"
+                f"?model={model}&width=1024&height=1024&seed={seed}&nologo=true&enhance=true"
+            )
+            img_r = requests.get(image_url, timeout=60)
+            if img_r.status_code == 200 and len(img_r.content) > 5000:
+                log_event(f"Image generated with model={model} prompt={prompt_en[:50]}")
+                return img_r.content
+        except Exception as e:
+            log_event(f"Image model {model} failed: {e}")
+            continue
+    
+    # Финальный fallback - простой URL без параметров
+    try:
+        fallback_url = f"https://image.pollinations.ai/prompt/{quote(prompt_en)}?width=768&height=768"
+        img_r = requests.get(fallback_url, timeout=60)
+        if img_r.status_code == 200:
+            return img_r.content
+    except Exception:
+        pass
+    
     return None
 
 def get_currency():
@@ -629,6 +704,30 @@ def get_weather(city):
                 f"☁️ {desc}\n💧 Влажность: {humid}%\n💨 Ветер: {wind} км/ч")
     except Exception:
         return f"😔 Не нашла погоду для '{city}'."
+def web_search(query):
+    """Поиск информации через DuckDuckGo."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(
+            f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1",
+            headers=headers, timeout=10
+        )
+        data = r.json()
+        results = []
+        # AbstractText - краткий ответ
+        if data.get("AbstractText"):
+            results.append(data["AbstractText"])
+        # RelatedTopics - связанные темы
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(topic["Text"])
+        if results:
+            return "\n\n".join(results[:3])
+        return None
+    except Exception:
+        return None
+
+
 
 def send_voice(chat_id, text):
     if not VOICE_ENABLED: return False
@@ -806,8 +905,10 @@ def main_menu_keyboard(username=""):
         types.InlineKeyboardButton("🔗 Пригласить друга",callback_data="btn_referral"),
         types.InlineKeyboardButton("📱 Мой аккаунт",    callback_data="btn_account"),
         types.InlineKeyboardButton("🔄 Новый диалог",    callback_data="btn_new"),
-        types.InlineKeyboardButton("ℹ️ Помощь",          callback_data="btn_help"),
-        types.InlineKeyboardButton("👨‍💻 Разработчик",     url="https://t.me/tronqx"),
+        types.InlineKeyboardButton("🌐 Поиск в интернете", callback_data="btn_websearch"),
+        types.InlineKeyboardButton("🧠 Моя память",       callback_data="btn_memory"),
+        types.InlineKeyboardButton("ℹ️ Помощь",           callback_data="btn_help"),
+        types.InlineKeyboardButton("👨‍💻 Разработчик",      url="https://t.me/tronqx"),
     )
     if is_admin(username):
         kb.add(types.InlineKeyboardButton("👑 Админ-панель", callback_data="adm_panel"))
@@ -816,11 +917,13 @@ def main_menu_keyboard(username=""):
 def after_message_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("📋 Меню",          callback_data="btn_menu"),
-        types.InlineKeyboardButton("🎵 Голос",         callback_data="btn_voice_last"),
-        types.InlineKeyboardButton("🧠 Объясни проще", callback_data="btn_explain_simple"),
-        types.InlineKeyboardButton("📓 В дневник",     callback_data="btn_save_note"),
-        types.InlineKeyboardButton("🔄 Новый диалог",  callback_data="btn_new"),
+        types.InlineKeyboardButton("📋 Меню",           callback_data="btn_menu"),
+        types.InlineKeyboardButton("🎵 Голос",          callback_data="btn_voice_last"),
+        types.InlineKeyboardButton("🧠 Объясни проще",  callback_data="btn_explain_simple"),
+        types.InlineKeyboardButton("📖 Подробнее",      callback_data="btn_elaborate"),
+        types.InlineKeyboardButton("🌐 Найти в сети",   callback_data="btn_websearch"),
+        types.InlineKeyboardButton("📓 В дневник",      callback_data="btn_save_note"),
+        types.InlineKeyboardButton("🔄 Новый диалог",   callback_data="btn_new"),
     )
     return kb
 
@@ -984,24 +1087,34 @@ def check_and_count(msg):
 # ══════════════════════════════════════════════
 def _generate_and_send(chat_id, uid, prompt, reply_to_msg=None):
     bot.send_chat_action(chat_id, "upload_photo")
-    wait_msg = bot.send_message(chat_id, "🎨 Рисую для тебя... Подожди ✨")
+    wait_msg = bot.send_message(chat_id, "🎨 Рисую для тебя... Это займёт 10-30 секунд ✨")
     try:
         img_data = generate_image(prompt)
-        bot.delete_message(chat_id, wait_msg.message_id)
+        try: bot.delete_message(chat_id, wait_msg.message_id)
+        except: pass
         if img_data:
             kb = types.InlineKeyboardMarkup(row_width=2)
             kb.add(
-                types.InlineKeyboardButton("🔄 Ещё раз", callback_data=f"imagine_again_{quote(prompt[:50])}"),
-                types.InlineKeyboardButton("📋 Меню",    callback_data="btn_menu"),
+                types.InlineKeyboardButton("🔄 Ещё вариант",  callback_data=f"imagine_again_{quote(prompt[:50])}"),
+                types.InlineKeyboardButton("🎨 Новый запрос", callback_data="imagine_custom"),
+                types.InlineKeyboardButton("📋 Меню",         callback_data="btn_menu"),
             )
-            if reply_to_msg:
-                bot.reply_to(reply_to_msg, f"🎨 Готово! Запрос: {prompt}")
-            bot.send_photo(chat_id, img_data, reply_markup=kb)
+            caption = f"🎨 {prompt[:100]}"
+            bot.send_photo(chat_id, img_data, caption=caption, reply_markup=kb)
         else:
-            bot.send_message(chat_id, "😔 Не смогла нарисовать. Попробуй другое описание.")
-    except Exception:
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            kb.add(
+                types.InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"imagine_again_{quote(prompt[:50])}"),
+                types.InlineKeyboardButton("✍️ Другое описание",   callback_data="imagine_custom"),
+            )
+            bot.send_message(chat_id,
+                "😔 Сервис картинок временно недоступен\n\n"
+                "Попробуй через минуту или опиши по-другому 🌸",
+                reply_markup=kb)
+    except Exception as e:
         try: bot.delete_message(chat_id, wait_msg.message_id)
         except: pass
+        log_event(f"Image generation error: {e}")
         bot.send_message(chat_id, "😔 Ошибка при генерации. Попробуй позже.")
 
 def _do_summarize(chat_id, uid, text, reply_to_msg=None):
@@ -1037,6 +1150,9 @@ def cmd_start(msg):
     is_new = db.register_user(uid, username, name)
     histories[uid] = []
     modes[uid]     = "normal"
+    # Сохраняем имя в памяти
+    if name and name != USER_NAME:
+        db.save_user_memory(uid, "name", name)
 
     parts     = msg.text.split()
     ref_bonus = ""
@@ -1056,19 +1172,20 @@ def cmd_start(msg):
         notify_admin(f"👤 Новый пользователь!\nID: {uid}\n@{username}\nИмя: {name}")
 
     greeting_text = (
-        f"{get_greeting()}, {name}! 🌸\n\n"
-        f"Я {BOT_NAME} — твоя AI-подруга 👑{ref_bonus}\n\n"
-        f"🎨 Рисую картинки\n"
-        f"🧠 Викторина и тесты\n"
-        f"🎤 Расшифровка голосовых\n"
-        f"📖 Пересказ и перевод\n"
-        f"🌤 Погода и курс валют\n"
-        f"📸 Решаю задачи с фото\n"
-        f"⏰ Напоминания и дневник\n"
-        f"🌙 Гороскоп, 💌 Письма, 💄 Уход\n\n"
+        f"{get_greeting()}, {name}! ✨{ref_bonus}\n\n"
+        f"Я *{BOT_NAME}* — твой умный AI-помощник 👑\n\n"
+        f"💬 Общаюсь как настоящий ChatGPT\n"
+        f"📸 Решаю задачи по фото\n"
+        f"🎨 Генерирую картинки\n"
+        f"🎤 Расшифровываю голосовые\n"
+        f"🌐 Ищу информацию в интернете\n"
+        f"🧮 Решаю математику и физику\n"
+        f"💻 Пишу код на любом языке\n"
+        f"🌙 Гороскоп, переводчик, рецепты\n"
+        f"🧠 Запоминаю тебя и твои интересы\n\n"
         f"Выбери с чего начнём 👇"
     )
-    bot.reply_to(msg, greeting_text, reply_markup=main_menu_keyboard(username))
+    bot.reply_to(msg, greeting_text, reply_markup=main_menu_keyboard(username), parse_mode="Markdown")
 
 @bot.message_handler(commands=["menu"])
 def cmd_menu(msg):
@@ -1251,14 +1368,26 @@ def handle_photo(msg):
         file_info = bot.get_file(photo.file_id)
         file_url  = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
         image_b64 = base64.b64encode(requests.get(file_url, timeout=20).content).decode("utf-8")
-        bot.send_message(uid, "📸 Смотрю на фото...")
-        answer = ask_ai(uid, msg.caption or "", image_b64=image_b64)
+        wait_photo = bot.send_message(uid, "📸 Анализирую фото... 🔍")
+        caption = msg.caption or ""
+        if not caption:
+            caption = "Подробно опиши что на фото. Если есть текст, задачи, уравнения, таблицы — прочитай и реши/объясни всё что видишь. Пиши без LaTeX, структурированно."
+        answer = ask_ai(uid, caption, image_b64=image_b64)
         last_answer[uid] = answer
+        try: bot.delete_message(uid, wait_photo.message_id)
+        except: pass
         for i in range(0, len(answer), 4096):
-            if i + 4096 >= len(answer):
-                bot.reply_to(msg, answer[i:i+4096], reply_markup=after_message_kb())
-            else:
-                bot.reply_to(msg, answer[i:i+4096])
+            chunk = answer[i:i+4096]
+            try:
+                if i + 4096 >= len(answer):
+                    bot.reply_to(msg, chunk, reply_markup=after_message_kb(), parse_mode="Markdown")
+                else:
+                    bot.reply_to(msg, chunk, parse_mode="Markdown")
+            except Exception:
+                if i + 4096 >= len(answer):
+                    bot.reply_to(msg, chunk, reply_markup=after_message_kb())
+                else:
+                    bot.reply_to(msg, chunk)
     except Exception:
         bot.reply_to(msg, "😔 Не смогла обработать фото.")
 
@@ -1291,11 +1420,13 @@ def successful_payment(msg):
 
     db.set_user(uid, exp, plan=plan)
     db.unblock(uid)
+    username_str = f"@{username}" if username else f"ID {uid}"
     bot.send_message(uid,
-        f"🎉 Оплата прошла успешно!\n\n"
-        f"⭐ Списано: {stars} Stars\n"
+        f"🎉 Оплата прошла! Спасибо, {username_str}!\n\n"
+        f"⭐ Оплачено: {stars} Stars\n"
         f"✅ Подписка активна: {days_text}\n\n"
-        f"Все функции открыты! Нажми /start 🌸")
+        f"Все функции без ограничений — пиши, спрашивай, генерируй! 🌸",
+        reply_markup=main_menu_keyboard(username))
     notify_admin(
         f"💳 Новая оплата!\nID: {uid} @{username}\nStars: {stars}\nПлан: {plan}")
     log_event(f"Payment: uid={uid} stars={stars} plan={plan}")
@@ -1356,27 +1487,41 @@ def handle_callback(call):
     if data.startswith("pay_stars_"):
         plan_key = data.replace("pay_stars_", "")
         plans = {
-            "30":      (PRICE_STARS, "30 дней"),
-            "90":      (200,         "90 дней"),
-            "forever": (500,         "Навсегда"),
+            "30":      (PRICE_STARS, "Подписка Лия — 30 дней", "30 дней"),
+            "90":      (200,         "Подписка Лия — 90 дней", "90 дней"),
+            "forever": (500,         "Подписка Лия — Навсегда", "Навсегда 🔥"),
         }
         if plan_key not in plans:
             bot.answer_callback_query(call.id); return
-        amount, label = plans[plan_key]
+        amount, title, label = plans[plan_key]
         bot.answer_callback_query(call.id)
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            types.InlineKeyboardButton("💬 Написать @tronqx", url="https://t.me/tronqx"),
-            types.InlineKeyboardButton("🔙 Назад", callback_data="btn_pay_stars"),
-        )
-        bot.send_message(uid,
-            f"⭐ Подписка: {label} — {amount} Telegram Stars\n\n"
-            f"Как оплатить:\n\n"
-            f"1️⃣ Напиши @tronqx:\n"
-            f"    Подписка {label}, мой ID: {uid}\n\n"
-            f"2️⃣ Отправь {amount} Stars через Telegram\n"
-            f"3️⃣ После оплаты доступ активируется 🌸",
-            reply_markup=kb)
+        try:
+            bot.send_invoice(
+                chat_id=uid,
+                title=title,
+                description=f"Полный доступ к боту {BOT_NAME} на {label}. Все функции без ограничений! 🌸",
+                invoice_payload=f"stars_{plan_key}_{uid}",
+                provider_token="",
+                currency="XTR",
+                prices=[types.LabeledPrice(label=label, amount=amount)],
+                photo_url="https://telegra.ph/file/dummy.jpg",
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+            )
+        except Exception as e:
+            log_event(f"Invoice error: {e}")
+            # Fallback — ручная оплата
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            kb.add(
+                types.InlineKeyboardButton("💬 Написать @tronqx", url="https://t.me/tronqx"),
+                types.InlineKeyboardButton("🔙 Назад", callback_data="btn_pay_stars"),
+            )
+            bot.send_message(uid,
+                f"⭐ {label} — {amount} Stars\n\n"
+                f"Напиши @tronqx: «Подписка {label}, ID: {uid}»\n"
+                f"Доступ активируют вручную 🌸",
+                reply_markup=kb)
         return
 
     # ── МОЙ АККАУНТ ──
@@ -1810,17 +1955,37 @@ def handle_callback(call):
     elif data == "btn_imagine":
         bot.answer_callback_query(call.id)
         modes[uid] = "imagine_mode"
+        kb_imagine = types.InlineKeyboardMarkup(row_width=2)
+        kb_imagine.add(
+            types.InlineKeyboardButton("🌅 Закат у моря",        callback_data="imagine_quick_sunset at sea, golden hour, photorealistic"),
+            types.InlineKeyboardButton("🌸 Аниме девушка",       callback_data="imagine_quick_beautiful anime girl, sakura, spring"),
+            types.InlineKeyboardButton("🏙 Ночной город",        callback_data="imagine_quick_night city lights, cyberpunk, neon"),
+            types.InlineKeyboardButton("🐱 Милый котик",         callback_data="imagine_quick_cute fluffy cat, soft lighting, adorable"),
+            types.InlineKeyboardButton("🌿 Лесная фея",          callback_data="imagine_quick_forest fairy, magical, fantasy art"),
+            types.InlineKeyboardButton("✨ Своё описание",       callback_data="imagine_custom"),
+        )
         bot.send_message(uid,
-            "🎨 Генератор картинок\n\nОпиши что нарисовать:\n\n"
-            "• красивый закат над морем\n"
-            "• уютная кофейня осенью\n"
-            "• котик в шапке астронавта\n\n"
-            "Пиши на русском — переведу сама! 🌸")
+            "🎨 Генератор картинок\n\nВыбери готовый стиль или опиши своё 👇",
+            reply_markup=kb_imagine)
 
     elif data.startswith("imagine_again_"):
         prompt = data.replace("imagine_again_", "")
         bot.answer_callback_query(call.id, "Рисую...")
         _generate_and_send(call.message.chat.id, uid, prompt)
+
+    elif data.startswith("imagine_quick_"):
+        prompt = data.replace("imagine_quick_", "")
+        bot.answer_callback_query(call.id, "🎨 Рисую...")
+        _generate_and_send(call.message.chat.id, uid, prompt)
+
+    elif data == "imagine_custom":
+        bot.answer_callback_query(call.id)
+        modes[uid] = "imagine_mode"
+        bot.send_message(uid,
+            "✍️ Опиши что нарисовать:\n\n"
+            "• Пиши на русском — переведу сама\n"
+            "• Чем подробнее описание — тем лучше картинка\n\n"
+            "Например: красивая девушка с розовыми волосами в японском стиле, сакура, мягкий свет")
 
     elif data == "btn_quiz":
         bot.answer_callback_query(call.id)
@@ -2157,6 +2322,57 @@ def handle_callback(call):
             lines = [f"{e['time']} — {e['mood']} {e['name']}" for e in log[-10:]]
             bot.send_message(uid, "📊 Последние записи:\n\n" + "\n".join(lines))
 
+    elif data == "btn_websearch":
+        bot.answer_callback_query(call.id)
+        modes[uid] = "websearch_mode"
+        bot.send_message(uid,
+            "🌐 Поиск в интернете\n\n"
+            "Напиши что найти:\n\n"
+            "• Курс биткоина сейчас\n"
+            "• Погода в Москве\n"
+            "• Новости сегодня\n"
+            "• Рецепт борща\n\n"
+            "Спрашивай что угодно! 🔍")
+
+    elif data == "btn_memory":
+        bot.answer_callback_query(call.id)
+        mem = db.get_user_memory(uid)
+        kb_mem = types.InlineKeyboardMarkup(row_width=1)
+        kb_mem.add(
+            types.InlineKeyboardButton("✏️ Изменить имя",      callback_data="mem_set_name"),
+            types.InlineKeyboardButton("🎂 День рождения",     callback_data="mem_set_birthday"),
+            types.InlineKeyboardButton("🏙 Мой город",         callback_data="mem_set_city"),
+            types.InlineKeyboardButton("💫 Мои интересы",      callback_data="mem_set_interests"),
+            types.InlineKeyboardButton("📝 О себе",            callback_data="mem_set_about"),
+            types.InlineKeyboardButton("🗑 Очистить память",   callback_data="mem_clear"),
+            types.InlineKeyboardButton("📋 Меню",              callback_data="btn_menu"),
+        )
+        if not mem or len(mem) <= 1:
+            text = "🧠 Память пустая\n\nРасскажи о себе — буду помнить и учитывать в разговоре! 💕"
+        else:
+            parts = []
+            if mem.get("name"):      parts.append(f"👤 Имя: {mem['name']}")
+            if mem.get("age"):       parts.append(f"🎂 Возраст: {mem['age']}")
+            if mem.get("birthday"):  parts.append(f"🎂 День рождения: {mem['birthday']}")
+            if mem.get("city"):      parts.append(f"🏙 Город: {mem['city']}")
+            if mem.get("interests"): parts.append(f"💫 Интересы: {mem['interests']}")
+            if mem.get("about"):     parts.append(f"📝 О себе: {mem['about']}")
+            text = "🧠 Что я о тебе знаю:\n\n" + "\n".join(parts)
+        bot.send_message(uid, text, reply_markup=kb_mem)
+
+    elif data.startswith("mem_set_"):
+        field = data.replace("mem_set_", "")
+        names = {"name": "имя", "birthday": "день рождения (например: 15 мая)", 
+                 "city": "город", "interests": "интересы (через запятую)", "about": "немного о себе"}
+        bot.answer_callback_query(call.id)
+        modes[uid] = f"mem_input_{field}"
+        bot.send_message(uid, f"✏️ Напиши своё {names.get(field, field)}:")
+
+    elif data == "mem_clear":
+        db.r.delete(f"memory:{uid}")
+        bot.answer_callback_query(call.id, "🗑 Память очищена!")
+        bot.send_message(uid, "🗑 Память очищена! Начнём знакомство заново 🌸")
+
     elif data == "btn_explain_simple":
         text = last_answer.get(uid, "")
         if not text:
@@ -2168,6 +2384,22 @@ def handle_callback(call):
                 f"Вот текст:\n{text}\n\nОбъясни это максимально просто — как подруга подруге. "
                 f"Без сложных слов, коротко, с примерами из жизни.",
                 custom_system="Объясняй очень просто, как подруга. Никаких сложных слов.")
+            last_answer[uid] = answer
+            bot.send_message(uid, answer, reply_markup=after_message_kb())
+        except Exception:
+            bot.send_message(uid, "😔 Ошибка!")
+
+    elif data == "btn_elaborate":
+        text = last_answer.get(uid, "")
+        if not text:
+            bot.answer_callback_query(call.id, "Нет текста!"); return
+        bot.answer_callback_query(call.id, "Расширяю ответ...")
+        bot.send_chat_action(uid, "typing")
+        try:
+            answer = ask_ai(uid,
+                f"Вот мой предыдущий ответ:\n{text}\n\n"
+                f"Расскажи об этом подробнее — добавь примеры, интересные факты, детали. "
+                f"Пиши структурированно и красиво.")
             last_answer[uid] = answer
             bot.send_message(uid, answer, reply_markup=after_message_kb())
         except Exception:
@@ -2329,6 +2561,44 @@ def handle_text(msg):
         return
 
     # ── Обычные режимы ──
+    if current_mode == "websearch_mode":
+        modes[uid] = "normal"
+        bot.send_chat_action(msg.chat.id, "typing")
+        wait = bot.reply_to(msg, "🔍 Ищу в интернете...")
+        try:
+            search_result = web_search(text)
+            if search_result:
+                prompt = f"Пользователь ищет: '{text}'\n\nНашла в интернете:\n{search_result}\n\nОтветь на основе этой информации, дополни своими знаниями. Пиши красиво и структурированно."
+            else:
+                prompt = f"Пользователь ищет: '{text}'\n\nОтветь на основе своих знаний максимально актуально и подробно."
+            answer = ask_ai(uid, prompt)
+            last_answer[uid] = answer
+            bot.delete_message(msg.chat.id, wait.message_id)
+            kb = types.InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                types.InlineKeyboardButton("🔍 Ещё поиск", callback_data="btn_websearch"),
+                types.InlineKeyboardButton("📋 Меню",      callback_data="btn_menu"),
+            )
+            bot.reply_to(msg, answer, reply_markup=kb)
+        except Exception:
+            try: bot.delete_message(msg.chat.id, wait.message_id)
+            except: pass
+            bot.reply_to(msg, "😔 Не смогла найти. Попробуй ещё раз.")
+        return
+
+    if current_mode.startswith("mem_input_"):
+        field = current_mode.replace("mem_input_", "")
+        modes[uid] = "normal"
+        db.save_user_memory(uid, field, text)
+        field_names = {"name": "имя", "birthday": "день рождения", "city": "город",
+                      "interests": "интересы", "about": "информация о себе"}
+        bot.reply_to(msg, f"✅ Запомнила: {field_names.get(field, field)} = {text} 💕\n\nТеперь буду учитывать это в разговоре!",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("🧠 Моя память", callback_data="btn_memory"),
+                types.InlineKeyboardButton("📋 Меню",       callback_data="btn_menu"),
+            ))
+        return
+
     if current_mode == "summarize_mode":
         modes[uid] = "normal"
         _do_summarize(msg.chat.id, uid, text, msg)
@@ -2401,15 +2671,37 @@ def handle_text(msg):
             ))
         return
 
+    # ── Умное определение — нужен ли поиск ──
+    search_keywords = ["сейчас", "сегодня", "курс", "цена", "стоит", "новости", 
+                       "погода", "актуально", "2024", "2025", "2026", "последний",
+                       "свежий", "недавно", "только что", "сколько стоит"]
+    need_search = any(kw in text.lower() for kw in search_keywords) and len(text) > 5
+    
+    extra_context = ""
+    if need_search:
+        bot.send_chat_action(msg.chat.id, "typing")
+        search_result = web_search(text)
+        if search_result:
+            extra_context = f"\n\n[Данные из интернета]: {search_result[:500]}"
+
     # ── Обычный чат ──
     try:
-        answer = ask_ai(uid, text)
+        full_text = text + extra_context if extra_context else text
+        answer = ask_ai(uid, full_text)
         last_answer[uid] = answer
         for i in range(0, len(answer), 4096):
-            if i + 4096 >= len(answer):
-                bot.reply_to(msg, answer[i:i+4096], reply_markup=after_message_kb())
-            else:
-                bot.reply_to(msg, answer[i:i+4096])
+            chunk = answer[i:i+4096]
+            try:
+                if i + 4096 >= len(answer):
+                    bot.reply_to(msg, chunk, reply_markup=after_message_kb(), parse_mode="Markdown")
+                else:
+                    bot.reply_to(msg, chunk, parse_mode="Markdown")
+            except Exception:
+                # Если Markdown сломался — отправляем без форматирования
+                if i + 4096 >= len(answer):
+                    bot.reply_to(msg, chunk, reply_markup=after_message_kb())
+                else:
+                    bot.reply_to(msg, chunk)
     except requests.exceptions.Timeout:
         bot.reply_to(msg, "⏳ Долго думаю... Попробуй ещё раз 💤")
     except requests.exceptions.ConnectionError:
@@ -2417,8 +2709,10 @@ def handle_text(msg):
     except Exception as e:
         if "429" in str(e).lower() or "limit" in str(e).lower():
             bot.reply_to(msg, "⏳ Слишком много сообщений! Подожди минуту 💤")
+        elif "model" in str(e).lower():
+            bot.reply_to(msg, "😔 Ошибка модели. Попробуй /new")
         else:
-            bot.reply_to(msg, "😔 Что-то пошло не так... Попробуй /new")
+            bot.reply_to(msg, "😔 Что-то пошло не так... Попробуй ещё раз")
 
 
 # ══════════════════════════════════════════════
