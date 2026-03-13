@@ -75,12 +75,17 @@ class RedisClient:
         self.url = url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {token}"}
     def _cmd(self, *args):
-        try:
-            r = requests.post(self.url, headers=self.headers, json=list(args), timeout=10)
-            return r.json().get("result")
-        except Exception as e:
-            log_event(f"Redis error: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                r = requests.post(self.url, headers=self.headers, json=list(args), timeout=8)
+                if r.status_code == 200:
+                    return r.json().get("result")
+                log_event(f"Redis HTTP {r.status_code} attempt {attempt+1}")
+            except Exception as e:
+                log_event(f"Redis error attempt {attempt+1}: {e}")
+            if attempt < 2:
+                time.sleep(0.3)
+        return None
     def get(self, key):
         raw = self._cmd("GET", key)
         if raw is None: return None
@@ -130,18 +135,34 @@ class DataStore:
             else: del access_cache[uid]
         # Потом Redis
         u = self.get_user(uid)
-        if not u: return False
-        exp = u.get("expires")
+        if not u:
+            # Redis не ответил или данных нет
+            # Проверяем paid_uids - если там есть, значит была подписка
+            if uid in self.r.smembers("paid_uids"):
+                log_event(f"has_access: Redis slow, uid={uid} in paid_uids - allowing")
+                return True
+            log_event(f"has_access: no data for uid={uid}")
+            return False
+        exp  = u.get("expires")
+        plan = u.get("plan", "paid")
         if exp is None:
-            access_cache[uid] = {"expires": None, "plan": u.get("plan","paid")}
+            access_cache[uid] = {"expires": None, "plan": plan}
             return True
         try:
-            exp_dt = datetime.fromisoformat(str(exp).strip())
+            exp_str = str(exp).strip().strip('"').strip("'")
+            exp_dt  = datetime.fromisoformat(exp_str)
             if datetime.now() < exp_dt:
-                access_cache[uid] = {"expires": exp_dt, "plan": u.get("plan","paid")}
+                access_cache[uid] = {"expires": exp_dt, "plan": plan}
                 return True
-            self.remove_user(uid); return False
-        except: return True
+            else:
+                log_event(f"has_access: expired uid={uid} exp={exp_str}")
+                self.remove_user(uid)
+                return False
+        except Exception as e:
+            log_event(f"has_access date parse error uid={uid}: {e} exp={exp}")
+            # Если не можем распарсить дату - даём доступ (не наказываем)
+            access_cache[uid] = {"expires": None, "plan": plan}
+            return True
 
     def sub_status(self, uid):
         uid = str(uid).strip()
@@ -386,14 +407,40 @@ def ask_ai(uid, text, image_b64=None, custom_system=None):
         msgs=[{"role":"system","content":sys_msg}]+history
         model=MODEL_TEXT; timeout=45
 
-    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json"},
-        data=json.dumps({"model":model,"messages":msgs,"max_tokens":2000}), timeout=timeout)
-    data=r.json()
-    if "error" in data: raise Exception(data["error"].get("message","Ошибка API"))
-    answer=clean_response(data["choices"][0]["message"]["content"])
-    if not image_b64: history.append({"role":"assistant","content":answer})
-    return answer
+    # Fallback модели если основная недоступна
+    models_to_try = [model]
+    if model == MODEL_TEXT:
+        models_to_try = [
+            "deepseek-r1-distill-llama-70b",
+            "llama-3.3-70b-versatile",
+            "llama3-70b-8192",
+        ]
+
+    last_error = "unknown"
+    for try_model in models_to_try:
+        try:
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json"},
+                data=json.dumps({"model":try_model,"messages":msgs,"max_tokens":2000}),
+                timeout=timeout)
+            data = r.json()
+            if "error" in data:
+                last_error = data["error"].get("message","API error")
+                log_event(f"Model {try_model} error: {last_error}")
+                continue
+            answer = clean_response(data["choices"][0]["message"]["content"])
+            if not image_b64: history.append({"role":"assistant","content":answer})
+            return answer
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+            log_event(f"Model {try_model} timeout")
+            continue
+        except Exception as e:
+            last_error = str(e)
+            log_event(f"Model {try_model} failed: {e}")
+            continue
+
+    raise Exception(f"Все модели недоступны: {last_error}")
 
 def transcribe_voice(audio, fname="voice.ogg"):
     r=requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
@@ -667,7 +714,21 @@ def cmd_menu(msg):
 
 @bot.message_handler(commands=["new"])
 def cmd_new(msg):
-    histories[msg.from_user.id]=[]; bot.reply_to(msg,"🔄 Начнём с чистого листа! 🌸")
+    uid = msg.from_user.id
+    histories[uid] = []
+    # Убираем из кэша чтобы заново проверить доступ
+    # (на случай если был баг с кэшем)
+    bot.reply_to(msg,"🔄 Начнём с чистого листа! Теперь пиши 🌸")
+
+@bot.message_handler(commands=["status"])
+def cmd_status(msg):
+    uid = msg.from_user.id
+    u   = msg.from_user.username or ""
+    has = db.has_access(uid, u)
+    sub = db.sub_status(uid)
+    cached = access_cache.get(str(uid))
+    text_st = f"ID: {uid}\nДоступ: {has}\nПодписка: {sub}\nКэш: {cached}\nVIP: {is_vip(u)}"
+    bot.reply_to(msg, f"Статус:\n\n{text_st}")
 
 @bot.message_handler(commands=["myid"])
 def cmd_myid(msg): bot.reply_to(msg,f"Твой ID: {msg.from_user.id}")
@@ -1712,13 +1773,18 @@ def handle_text(msg):
         last_answer[uid]=answer
         send_safe(uid,answer,reply_to=msg,kb=after_kb())
     except requests.exceptions.Timeout:
-        bot.reply_to(msg,"⏳ Долго думаю... Попробуй ещё раз 💤")
+        bot.reply_to(msg,"⏳ Сервер думает долго... Попробуй ещё раз!")
     except Exception as e:
         log_event(f"Chat error: {e}")
-        if "429" in str(e) or "limit" in str(e).lower():
-            bot.reply_to(msg,"⏳ Слишком много запросов. Подожди минуту!")
+        err_str = str(e).lower()
+        if "429" in err_str or "limit" in err_str or "quota" in err_str:
+            bot.reply_to(msg,"⏳ Много запросов одновременно. Подожди 30 секунд и попробуй!")
+        elif "timeout" in err_str:
+            bot.reply_to(msg,"⏳ Долго думаю... Попробуй написать ещё раз!")
+        elif "все модели" in err_str:
+            bot.reply_to(msg,"😔 ИИ временно недоступен. Попробуй через минуту!")
         else:
-            bot.reply_to(msg,"😔 Что-то пошло не так. Попробуй /new")
+            bot.reply_to(msg,"😔 Ошибка соединения. Напиши ещё раз!")
 
 print(f"👑 Лия v3.0 запущена!")
 print(f"🤖 Модель: {MODEL_TEXT}")
