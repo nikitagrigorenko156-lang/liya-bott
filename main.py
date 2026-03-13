@@ -107,23 +107,39 @@ class DataStore:
         exp_str = expires.isoformat() if isinstance(expires, datetime) else (str(expires).strip() if expires else None)
         self.r.set(f"user:{uid}", {"expires": exp_str, "plan": plan})
         self.r.sadd("paid_uids", uid)
+        # Сразу обновляем локальный кэш
+        exp_dt = expires if isinstance(expires, datetime) else None
+        access_cache[uid] = {"expires": exp_dt, "plan": plan}
         log_event(f"set_user uid={uid} plan={plan} exp={exp_str}")
 
     def remove_user(self, uid):
         uid = str(uid).strip()
         self.r.delete(f"user:{uid}")
         self.r.srem("paid_uids", uid)
+        access_cache.pop(uid, None)
 
     def has_access(self, uid, username=""):
         uid = str(uid).strip()
         if username and username.lower().lstrip("@") in VIP_USERNAMES: return True
         if self.is_blocked(uid): return False
+        # Сначала проверяем локальный кэш (мгновенно)
+        if uid in access_cache:
+            cached = access_cache[uid]
+            if cached.get("expires") is None: return True
+            if datetime.now() < cached["expires"]: return True
+            else: del access_cache[uid]
+        # Потом Redis
         u = self.get_user(uid)
         if not u: return False
         exp = u.get("expires")
-        if exp is None: return True
+        if exp is None:
+            access_cache[uid] = {"expires": None, "plan": u.get("plan","paid")}
+            return True
         try:
-            if datetime.now() < datetime.fromisoformat(str(exp).strip()): return True
+            exp_dt = datetime.fromisoformat(str(exp).strip())
+            if datetime.now() < exp_dt:
+                access_cache[uid] = {"expires": exp_dt, "plan": u.get("plan","paid")}
+                return True
             self.remove_user(uid); return False
         except: return True
 
@@ -281,6 +297,8 @@ class DataStore:
 db  = DataStore()
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 histories={};modes={};mood_log={};todo_list={};last_answer={};quiz_state={}
+# Локальный кэш доступа - работает мгновенно без задержки Redis
+access_cache = {}  # uid -> {"expires": datetime, "plan": str}
 MAX_HISTORY=20
 try:
     from gtts import gTTS
@@ -459,8 +477,11 @@ def send_long(chat_id, text, reply_to=None, kb=None):
             else: bot.send_message(chat_id,chunk,reply_markup=markup)
         except: pass
 
-def send_safe(chat_id, text, reply_to=None, kb=None):
-    """Отправляет сообщение частями если длинное."""
+def send_safe(chat_id, text, reply_to=None, kb=None, delete_msg_id=None):
+    """Отправляет сообщение частями если длинное. Удаляет старое если указано."""
+    if delete_msg_id:
+        try: bot.delete_message(chat_id, delete_msg_id)
+        except: pass
     chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
     for i, chunk in enumerate(chunks):
         markup = kb if i == len(chunks)-1 else None
@@ -471,6 +492,16 @@ def send_safe(chat_id, text, reply_to=None, kb=None):
                 bot.send_message(chat_id, chunk, reply_markup=markup)
         except Exception as e:
             log_event(f"send_safe error: {e}")
+
+def delete_and_send(call, text, kb=None):
+    """Удаляет сообщение с кнопками и отправляет новое."""
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except: pass
+    try:
+        bot.send_message(call.from_user.id, text, reply_markup=kb)
+    except Exception as e:
+        log_event(f"delete_and_send error: {e}")
 
 # ── КЛАВИАТУРЫ ──
 ZODIAC_SIGNS=["♈ Овен","♉ Телец","♊ Близнецы","♋ Рак","♌ Лев","♍ Дева","♎ Весы","♏ Скорпион","♐ Стрелец","♑ Козерог","♒ Водолей","♓ Рыбы"]
@@ -706,23 +737,51 @@ def handle_photo(msg):
     bot.send_chat_action(msg.chat.id,"typing")
     wait=None
     try:
-        fi=bot.get_file(msg.photo[-1].file_id)
-        resp=requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}",timeout=30)
-        if resp.status_code!=200: bot.reply_to(msg,"😔 Не смогла скачать фото. Попробуй ещё раз!"); return
-        image_b64=base64.b64encode(resp.content).decode("utf-8")
-        wait=bot.send_message(uid,"📸 Анализирую фото...")
-        caption=msg.caption or "Подробно опиши что на фото. Если есть задачи, уравнения или текст — прочитай и реши/объясни пошагово. Без LaTeX."
-        answer=ask_ai(uid,caption,image_b64=image_b64)
-        last_answer[uid]=answer
-        try: bot.delete_message(uid,wait.message_id)
+        # Берём фото лучшего качества но не слишком большое
+        photos = msg.photo
+        # Берём предпоследнее - хорошее качество но не огромное
+        photo = photos[-2] if len(photos) >= 2 else photos[-1]
+        fi = bot.get_file(photo.file_id)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}"
+        resp = requests.get(file_url, timeout=30)
+        if resp.status_code != 200:
+            bot.reply_to(msg, "😔 Не смогла скачать фото. Попробуй ещё раз!")
+            return
+        image_b64 = base64.b64encode(resp.content).decode("utf-8")
+        wait = bot.send_message(uid, "📸 Анализирую фото... ⏳")
+        caption = msg.caption or "Внимательно посмотри на фото. Если на фото есть математика, задачи, уравнения, текст — прочитай всё и реши/объясни пошагово. Пиши обычным текстом без LaTeX символов."
+        # Используем vision модель
+        msgs_vision = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": caption}
+            ]}
+        ]
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            data=json.dumps({"model": MODEL_VISION, "messages": msgs_vision, "max_tokens": 2000}),
+            timeout=60
+        )
+        data = r.json()
+        if "error" in data:
+            error_msg = data["error"].get("message", "")
+            log_event(f"Vision API error: {error_msg}")
+            # Если ошибка модели - пробуем без фото
+            answer = ask_ai(uid, f"Пользователь прислал фото с подписью: '{caption}'. Скажи что не смогла обработать фото и предложи описать задачу текстом.")
+        else:
+            answer = clean_response(data["choices"][0]["message"]["content"])
+        last_answer[uid] = answer
+        try: bot.delete_message(uid, wait.message_id)
         except: pass
-        send_safe(uid,answer,reply_to=msg,kb=after_kb())
+        send_safe(uid, answer, reply_to=msg, kb=after_kb())
     except Exception as e:
         log_event(f"Photo error: {e}")
         try:
-            if wait: bot.delete_message(uid,wait.message_id)
+            if wait: bot.delete_message(uid, wait.message_id)
         except: pass
-        bot.reply_to(msg,"😔 Ошибка при обработке фото.\n\nПопробуй:\n• Отправить заново\n• Уменьшить фото\n• Написать вопрос текстом")
+        bot.reply_to(msg, "😔 Не смогла обработать фото. Напиши задачу текстом — обязательно помогу!")
 
 # ── ПЛАТЕЖИ ──
 @bot.pre_checkout_query_handler(func=lambda q: True)
@@ -750,6 +809,8 @@ def handle_callback(call):
     # ── ПРОБНЫЙ ПЕРИОД ──
     if data=="btn_trial":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         if db.get_user(uid): bot.send_message(uid,f"У тебя уже есть подписка!\nСтатус: {db.sub_status(uid)}"); return
         exp=datetime.now()+timedelta(days=TRIAL_DAYS)
         db.set_user(uid,exp,plan="trial")
@@ -764,6 +825,8 @@ def handle_callback(call):
     # ── ОПЛАТА ──
     if data=="btn_pay_stars":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=1)
         kb.add(
             types.InlineKeyboardButton(f"⭐ {PRICE_STARS} Stars — 30 дней",callback_data="pay_stars_30"),
@@ -796,6 +859,8 @@ def handle_callback(call):
     # ── АККАУНТ ──
     if data=="btn_account":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         st=db.r.get(f"stats:{uid}") or {}; ref=db.r.get(f"referral:{uid}") or {}
         code=db.get_ref_code(uid); link=f"https://t.me/{bot.get_me().username}?start={code}"
         kb=types.InlineKeyboardMarkup(row_width=2)
@@ -809,11 +874,15 @@ def handle_callback(call):
     # ── МЕНЮ ──
     if data=="btn_menu":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         bot.send_message(uid,f"Меню 🌸 | Режим: {mode_name(uid)}",reply_markup=main_menu_kb(u))
         return
 
     if data=="btn_new":
         histories[uid]=[]; bot.answer_callback_query(call.id,"🔄 Очищено!")
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         bot.send_message(uid,"🔄 Новый диалог! Пиши что угодно 🌸")
         return
 
@@ -838,6 +907,8 @@ def handle_callback(call):
     # ── КАРТИНКИ ──
     if data=="btn_imagine":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("🌅 Закат у моря",   callback_data="imagine_q_sunset at sea golden hour photorealistic"),
@@ -869,6 +940,8 @@ def handle_callback(call):
     # ── ГОРОСКОП ──
     if data=="btn_horoscope":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=3)
         for s in ZODIAC_SIGNS: kb.add(types.InlineKeyboardButton(s,callback_data=f"zodiac_{s}"))
         bot.send_message(uid,"🌙 Выбери знак:",reply_markup=kb)
@@ -890,6 +963,8 @@ def handle_callback(call):
     # ── ВИКТОРИНА ──
     if data=="btn_quiz":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         for name,val in QUIZ_TOPICS.items(): kb.add(types.InlineKeyboardButton(name,callback_data=f"quiz_{val}"))
         kb.add(types.InlineKeyboardButton("📋 Меню",callback_data="btn_menu"))
@@ -954,6 +1029,8 @@ def handle_callback(call):
     # ── КРАСОТА ──
     if data=="btn_beauty":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("💡 Лайфхак",         callback_data="beauty_tip"),
@@ -983,6 +1060,8 @@ def handle_callback(call):
     # ── ЛЮБОВНЫЕ ПИСЬМА ──
     if data=="btn_love":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("💌 Письмо",         callback_data="love_letter"),
@@ -1011,6 +1090,8 @@ def handle_callback(call):
     # ── МЕДИТАЦИЯ ──
     if data=="btn_meditation":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=1)
         for i,m in enumerate(MEDITATIONS): kb.add(types.InlineKeyboardButton(m["name"],callback_data=f"med_{i}"))
         kb.add(types.InlineKeyboardButton("📋 Меню",callback_data="btn_menu"))
@@ -1028,6 +1109,8 @@ def handle_callback(call):
     # ── НАСТРОЕНИЕ ──
     if data=="btn_mood":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=4)
         kb.add(*[types.InlineKeyboardButton(e,callback_data=f"mood_{e}") for e in MOOD_EMOJIS])
         kb.add(types.InlineKeyboardButton("📈 История",callback_data="mood_hist"),types.InlineKeyboardButton("📋 Меню",callback_data="btn_menu"))
@@ -1058,6 +1141,8 @@ def handle_callback(call):
     # ── ПЕРЕВОДЧИК ──
     if data=="btn_translate":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         for name,val in LANGUAGES.items(): kb.add(types.InlineKeyboardButton(name,callback_data=f"trl_{val}"))
         kb.add(types.InlineKeyboardButton("📋 Меню",callback_data="btn_menu"))
@@ -1091,6 +1176,8 @@ def handle_callback(call):
     # ── РЕЦЕПТЫ ──
     if data=="btn_recipe":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("🥘 По продуктам",   callback_data="recipe_custom"),
@@ -1124,6 +1211,8 @@ def handle_callback(call):
     # ── ПЛАНИРОВЩИК ──
     if data=="btn_planner":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb=types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("🗓 План дня",        callback_data="plan_day"),
@@ -1151,6 +1240,8 @@ def handle_callback(call):
     # ── СПИСОК ДЕЛ ──
     if data=="btn_todo":
         bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         todos=todo_list.get(uid,[]); done=sum(1 for t in todos if t["done"])
         kb=types.InlineKeyboardMarkup(row_width=1)
         for i,t in enumerate(todos):
@@ -1175,7 +1266,10 @@ def handle_callback(call):
 
     # ── НАПОМИНАНИЯ ──
     if data=="btn_reminders":
-        bot.answer_callback_query(call.id); rems=db.get_reminders(uid)
+        bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        rems=db.get_reminders(uid)
         kb=types.InlineKeyboardMarkup(row_width=1)
         for i,r in enumerate(rems):
             d="🔁" if r.get("daily") else "1️⃣"
@@ -1194,7 +1288,10 @@ def handle_callback(call):
 
     # ── ДНЕВНИК ──
     if data=="btn_notes":
-        bot.answer_callback_query(call.id); notes=db.get_notes(uid)
+        bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        notes=db.get_notes(uid)
         kb=types.InlineKeyboardMarkup(row_width=2)
         kb.add(types.InlineKeyboardButton("✍️ Написать",callback_data="note_text"),
                types.InlineKeyboardButton("🎤 Голосом",callback_data="note_voice"),
@@ -1215,7 +1312,10 @@ def handle_callback(call):
 
     # ── ПАМЯТЬ ──
     if data=="btn_memory":
-        bot.answer_callback_query(call.id); mem=db.get_memory(uid)
+        bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        mem=db.get_memory(uid)
         kb=types.InlineKeyboardMarkup(row_width=1)
         kb.add(types.InlineKeyboardButton("✏️ Имя",callback_data="mem_name"),
                types.InlineKeyboardButton("🎂 День рождения",callback_data="mem_birthday"),
@@ -1342,7 +1442,10 @@ def handle_callback(call):
         if not is_admin(u): bot.answer_callback_query(call.id,"❌ Нет доступа!"); return
 
     if data in("adm_panel","adm_back"):
-        bot.answer_callback_query(call.id); a=db.get_analytics()
+        bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        a=db.get_analytics()
         bot.send_message(uid,
             f"👑 Админ-панель\n\n👥 Пользователей: {a['total_users']}\n"
             f"💎 Платных: {a['paid_users']}\n📊 DAU: {a['dau_today']}\n"
