@@ -411,9 +411,10 @@ def ask_ai(uid, text, image_b64=None, custom_system=None):
     models_to_try = [model]
     if model == MODEL_TEXT:
         models_to_try = [
-            "deepseek-r1-distill-llama-70b",
             "llama-3.3-70b-versatile",
             "llama3-70b-8192",
+            "llama3-8b-8192",
+            "gemma2-9b-it",
         ]
 
     last_error = "unknown"
@@ -658,7 +659,8 @@ def check_access(msg):
     if is_vip(u): return True
     if db.is_blocked(str(uid)): bot.reply_to(msg,"🚫 Заблокирована!"); return False
     if db.has_access(uid,u): return True
-    bot.reply_to(msg,f"🔒 Доступ платный\n\n⭐ {PRICE_STARS} Stars\n\n🎁 Или 3 дня бесплатно:",reply_markup=access_kb())
+    modes[uid] = "normal"  # Сбрасываем режим
+    bot.reply_to(msg, f"🔒 Доступ платный\n\n⭐ {PRICE_STARS} Stars или @tronqx\n\n🎁 Или 3 дня бесплатно!", reply_markup=access_kb())
     return False
 
 def check_access_cb(call):
@@ -666,8 +668,12 @@ def check_access_cb(call):
     if is_vip(u): return True
     if db.is_blocked(str(uid)): bot.answer_callback_query(call.id,"🚫 Заблокирована!"); return False
     if db.has_access(uid,u): return True
+    # Сбрасываем застрявший режим
+    modes[uid] = "normal"
     bot.answer_callback_query(call.id,"🔒 Нет доступа!")
-    bot.send_message(uid,f"🔒 Нужна подписка!\n\n⭐ {PRICE_STARS} Stars или @tronqx",reply_markup=access_kb())
+    try: bot.delete_message(call.message.chat.id, call.message.message_id)
+    except: pass
+    bot.send_message(uid, f"🔒 Нужна подписка!\n\n⭐ {PRICE_STARS} Stars или @tronqx\n\n🎁 Или 3 дня бесплатно!", reply_markup=access_kb())
     return False
 
 def check_and_count(msg):
@@ -716,9 +722,8 @@ def cmd_menu(msg):
 def cmd_new(msg):
     uid = msg.from_user.id
     histories[uid] = []
-    # Убираем из кэша чтобы заново проверить доступ
-    # (на случай если был баг с кэшем)
-    bot.reply_to(msg,"🔄 Начнём с чистого листа! Теперь пиши 🌸")
+    modes[uid] = "normal"  # Сбрасываем застрявший режим
+    bot.reply_to(msg, "🔄 Начнём с чистого листа! Теперь пиши 🌸")
 
 @bot.message_handler(commands=["status"])
 def cmd_status(msg):
@@ -1581,6 +1586,7 @@ def handle_callback(call):
     if data=="adm_broadcast": bot.answer_callback_query(call.id); modes[uid]="adm_broadcast"; bot.send_message(uid,"📢 Напиши сообщение для рассылки:"); return
 
 def _gen_img(chat_id,uid,prompt):
+    modes[uid]="normal"  # Сбрасываем режим сразу
     wait=bot.send_message(chat_id,"🎨 Рисую... 10-30 сек ✨")
     try:
         img=generate_image(prompt)
@@ -1631,7 +1637,13 @@ def handle_text(msg):
 
     # ── Спецрежимы ──
     if m=="imagine_mode":
-        modes[uid]="normal"; _gen_img(msg.chat.id,uid,text); return
+        modes[uid] = "normal"
+        q_words = ["как", "что", "почему", "когда", "где", "кто", "зачем",
+                   "помоги", "объясни", "расскажи", "привет", "мне ", "я "]
+        is_q = any(text.lower().startswith(w) for w in q_words) or "?" in text
+        if not is_q:
+            _gen_img(msg.chat.id, uid, text)
+            return
 
     if m=="note_mode":
         modes[uid]="normal"; db.add_note(uid,text)
@@ -1775,16 +1787,15 @@ def handle_text(msg):
     except requests.exceptions.Timeout:
         bot.reply_to(msg,"⏳ Сервер думает долго... Попробуй ещё раз!")
     except Exception as e:
-        log_event(f"Chat error: {e}")
+        modes[uid] = "normal"  # сбрасываем застрявший режим
+        log_event(f"Chat error uid={uid}: {e}")
         err_str = str(e).lower()
         if "429" in err_str or "limit" in err_str or "quota" in err_str:
-            bot.reply_to(msg,"⏳ Много запросов одновременно. Подожди 30 секунд и попробуй!")
-        elif "timeout" in err_str:
-            bot.reply_to(msg,"⏳ Долго думаю... Попробуй написать ещё раз!")
-        elif "все модели" in err_str:
+            bot.reply_to(msg,"⏳ Много запросов. Подожди 30 секунд!")
+        elif "все модели" in err_str or "unavailable" in err_str:
             bot.reply_to(msg,"😔 ИИ временно недоступен. Попробуй через минуту!")
         else:
-            bot.reply_to(msg,"😔 Ошибка соединения. Напиши ещё раз!")
+            bot.reply_to(msg,"😔 Ошибка соединения. Напиши ещё раз или /new")
 
 print(f"👑 Лия v3.0 запущена!")
 print(f"🤖 Модель: {MODEL_TEXT}")
