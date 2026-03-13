@@ -100,7 +100,7 @@ class DataStore:
     def __init__(self):
         self.r = RedisClient(UPSTASH_URL, UPSTASH_TOKEN)
 
-    def get_user(self, uid): return self.r.get(f"user:{uid}")
+    def get_user(self, uid): return self.r.get(f"user:{str(uid).strip()}")
 
     def set_user(self, uid, expires, plan="paid"):
         uid = str(uid).strip()
@@ -145,7 +145,7 @@ class DataStore:
 
     def block(self, uid): self.r.sadd("blocked", str(uid))
     def unblock(self, uid): self.r.srem("blocked", str(uid))
-    def is_blocked(self, uid): return str(uid) in self.r.smembers("blocked")
+    def is_blocked(self, uid): return str(uid).strip() in self.r.smembers("blocked")
 
     def register_user(self, uid, username, name):
         uid = str(uid).strip()
@@ -386,24 +386,48 @@ def transcribe_voice(audio, fname="voice.ogg"):
     raise Exception(f"Whisper {r.status_code}")
 
 def generate_image(prompt_ru):
+    # Переводим на английский
+    prompt_en = prompt_ru
     try:
-        r=requests.post("https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json"},
-            data=json.dumps({"model":"llama-3.3-70b-versatile",
-                "messages":[{"role":"user","content":f"Translate to English for image, only translation: {prompt_ru}"}],
-                "max_tokens":100}),timeout=15)
-        prompt_en=r.json()["choices"][0]["message"]["content"].strip()
-    except: prompt_en=prompt_ru
-    for model in ["flux","flux-realism","turbo","flux-anime"]:
-        try:
-            seed=random.randint(1,999999)
-            resp=requests.get(f"https://image.pollinations.ai/prompt/{quote(prompt_en)}?model={model}&width=1024&height=1024&seed={seed}&nologo=true",timeout=60)
-            if resp.status_code==200 and len(resp.content)>5000: return resp.content
-        except: continue
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            data=json.dumps({"model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": f"Translate to English for image generation, respond with translation only, no extra words: {prompt_ru}"}],
+                "max_tokens": 150}), timeout=15)
+        translated = r.json()["choices"][0]["message"]["content"].strip()
+        if translated and len(translated) < 500:
+            prompt_en = translated
+    except Exception as e:
+        log_event(f"Translation error: {e}")
+
+    log_event(f"Generating image: {prompt_en[:80]}")
+
+    # Пробуем разные модели Pollinations
+    for model in ["flux", "turbo", "flux-realism"]:
+        for attempt in range(2):
+            try:
+                seed = random.randint(1, 99999)
+                url = f"https://image.pollinations.ai/prompt/{quote(prompt_en)}?model={model}&width=1024&height=1024&seed={seed}&nologo=true&safe=false"
+                resp = requests.get(url, timeout=90, stream=True)
+                if resp.status_code == 200:
+                    data = resp.content
+                    if len(data) > 1000:
+                        log_event(f"Image OK: model={model} size={len(data)}")
+                        return data
+                log_event(f"Image attempt failed: model={model} status={resp.status_code}")
+            except Exception as e:
+                log_event(f"Image error model={model}: {e}")
+                time.sleep(2)
+
+    # Последний шанс - простой запрос
     try:
-        resp=requests.get(f"https://image.pollinations.ai/prompt/{quote(prompt_en)}?width=768&height=768",timeout=60)
-        if resp.status_code==200: return resp.content
-    except: pass
+        simple_url = f"https://image.pollinations.ai/prompt/{quote(prompt_en)}"
+        resp = requests.get(simple_url, timeout=90)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+    except Exception as e:
+        log_event(f"Final image attempt failed: {e}")
+
     return None
 
 def get_weather(city):
@@ -490,6 +514,7 @@ def main_menu_kb(username=""):
         types.InlineKeyboardButton("🌟 Факт дня",        callback_data="btn_fact"),
         types.InlineKeyboardButton("💪 Мотивация",       callback_data="btn_motivation"),
         types.InlineKeyboardButton("✨ Комплимент",      callback_data="btn_compliment"),
+        types.InlineKeyboardButton("📸 Анализ фото",     callback_data="btn_photo_hint"),
         types.InlineKeyboardButton("📱 Мой аккаунт",    callback_data="btn_account"),
         types.InlineKeyboardButton("🔄 Новый диалог",    callback_data="btn_new"),
         types.InlineKeyboardButton("ℹ️ Помощь",          callback_data="btn_help"),
@@ -1232,6 +1257,14 @@ def handle_callback(call):
         return
 
     # ── РАЗНОЕ ──
+    if data=="btn_photo_hint":
+        bot.answer_callback_query(call.id)
+        text_ph = "📸 Как отправить фото на анализ:\n\nПросто отправь фото в чат!\n\nЯ умею:\n• Решать задачи по фото\n• Читать текст на фото\n• Анализировать графики\n• Описывать что на фото\n\nДобавь подпись — отвечу точнее!"
+        kb_ph = types.InlineKeyboardMarkup()
+        kb_ph.add(types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        bot.send_message(uid, text_ph, reply_markup=kb_ph)
+        return
+
     if data=="btn_joke":
         bot.answer_callback_query(call.id,"😂"); bot.send_chat_action(uid,"typing")
         try:
