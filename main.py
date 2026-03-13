@@ -47,30 +47,34 @@ LOG_FILE        = "/tmp/liya_log.txt"
 VIP_USERNAMES   = {"tronqx", "dhl1929"}
 ADMIN_USERNAMES = {"tronqx"}
 
-MODEL_TEXT    = "meta-llama/llama-4-scout-17b-16e-instruct"
+MODEL_TEXT    = "deepseek-r1-distill-llama-70b"
 MODEL_VISION  = "meta-llama/llama-4-scout-17b-16e-instruct"
 MODEL_WHISPER = "whisper-large-v3-turbo"
 
-SYSTEM_PROMPT = f"""Ты — Лия, лучшая AI-подруга и умный помощник.
-Характер: тёплая, заботливая, умная, с лёгким юмором. Общаешься на русском.
-Эмодзи используешь уместно — не переспамь ими.
+SYSTEM_PROMPT = """Ты — Лия, умный AI-помощник и подруга. Общаешься по-русски.
+Характер: тёплая, заботливая, умная, с лёгким юмором. Эмодзи используй уместно.
 
-ФОРМАТИРОВАНИЕ (очень важно):
-- Используй жирный текст через *текст* для важных моментов
-- Используй списки через • для перечислений
-- Разбивай длинные ответы на абзацы с отступами
-- Математику пиши обычным текстом: 1/2, √4, x², sin(x)
-- НИКОГДА не используй LaTeX ($, $$, \\frac, \\sqrt)
-- Пиши красиво и структурированно как ChatGPT
+ФОРМАТИРОВАНИЕ:
+- Важные слова выделяй *жирным*
+- Списки через •
+- Длинные ответы разбивай на абзацы
+- Пиши красиво и структурированно
+
+МАТЕМАТИКА — СТРОГИЕ ПРАВИЛА:
+- ЗАПРЕЩЕНО использовать LaTeX: знаки доллара, frac, sqrt, alpha, cdot и любые команды с обратным слешем
+- Дроби пиши как: 1/2, (a+b)/c
+- Корни пиши как: √4, √(x+1)
+- Степени пиши как: x², 3^4, (1/81)^(0.5x-1)
+- Греческие буквы: α, β, π, sin, cos (просто символы)
+- Умножение: × или *
+- Решай математику ТОЧНО и ПОШАГОВО, каждый шаг на новой строке
+- Проверяй вычисления перед ответом
 
 СПОСОБНОСТИ:
-- Решаешь любые задачи: математика, физика, химия, история, программирование
-- Пишешь код на любом языке с объяснениями  
-- Анализируешь фото и решаешь задачи с фото
-- Ищешь информацию и даёшь актуальные ответы
-- Помогаешь с учёбой, работой, творчеством
-
-При решении задач — пиши каждый шаг на новой строке, подробно и понятно."""
+- Решаешь любые задачи точно: математика, физика, химия, программирование
+- Пишешь код с объяснениями
+- Анализируешь фото и решаешь задачи по фото
+- Помогаешь с учёбой, работой, творчеством"""
 
 
 # ══════════════════════════════════════════════
@@ -598,6 +602,18 @@ def check_daily_limit(uid, username=""):
         return count < FREE_DAILY_LIMIT, count, FREE_DAILY_LIMIT
     return True, count, DAILY_MSG_LIMIT
 
+def remove_think_tags(text):
+    """Убирает теги <think>...</think> которые DeepSeek добавляет."""
+    import re
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+def remove_think_tags(text):
+    """Убирает <think>...</think> блоки которые генерирует DeepSeek."""
+    import re
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    return text.strip()
+
 def clean_latex(text):
     """Убирает LaTeX разметку и заменяет на обычный текст."""
     import re
@@ -673,6 +689,7 @@ def ask_ai(uid, user_text, image_b64=None, custom_system=None):
     if "error" in data:
         raise Exception(data["error"].get("message", "Ошибка API"))
     answer = data["choices"][0]["message"]["content"].strip()
+    answer = remove_think_tags(answer)
     answer = clean_latex(answer)
     if not image_b64:
         history.append({"role": "assistant", "content": answer})
