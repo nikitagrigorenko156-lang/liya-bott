@@ -6,7 +6,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_KEY", "")
-GEMINI_KEY = os.environ.get("AIzaSyCaK7T5BDWW1iChKzCegEbXKqHhwA1-gy0", "")  # НОВОЕ: получи бесплатно на aistudio.google.com
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "")  # НОВОЕ: получи бесплатно на aistudio.google.com
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
@@ -622,7 +622,17 @@ def ask_ai(uid, text, image_b64=None, custom_system=None):
 
     msgs = [{"role": "system", "content": sys_msg}] + history
 
-    # Список моделей Groq для перебора
+    # СНАЧАЛА пробуем Gemini — он быстрее и стабильнее
+    if GEMINI_KEY:
+        try:
+            log_event("Trying Gemini first...")
+            answer = ask_gemini(text, sys_msg, history[:-1])
+            history.append({"role": "assistant", "content": answer})
+            return answer
+        except Exception as e:
+            log_event(f"Gemini failed: {e}, trying Groq...")
+
+    # Fallback на Groq если Gemini не сработал
     groq_models = [
         "llama-3.3-70b-versatile",
         "llama3-70b-8192",
@@ -637,7 +647,7 @@ def ask_ai(uid, text, image_b64=None, custom_system=None):
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
                 data=json.dumps({"model": try_model, "messages": msgs, "max_tokens": 2000}),
-                timeout=35  # УЛУЧШЕНО: таймаут 35 сек
+                timeout=25
             )
             data = r.json()
             if "error" in data:
@@ -655,16 +665,6 @@ def ask_ai(uid, text, image_b64=None, custom_system=None):
             last_error = str(e)
             log_event(f"Groq {try_model} failed: {e}")
             continue
-
-    # НОВОЕ: Fallback на Gemini если все Groq модели упали
-    if GEMINI_KEY:
-        log_event("All Groq models failed, switching to Gemini...")
-        try:
-            answer = ask_gemini(text, sys_msg, history[:-1])  # история без последнего user msg
-            history.append({"role": "assistant", "content": answer})
-            return answer + "\n\n_(ответ через резервный AI)_"
-        except Exception as e:
-            log_event(f"Gemini fallback also failed: {e}")
 
     raise Exception(f"Все AI модели недоступны: {last_error}")
 
