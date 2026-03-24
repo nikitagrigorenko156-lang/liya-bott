@@ -6,7 +6,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_KEY", "")
-GEMINI_KEY = os.environ.get("GEMINI_KEY", "")  # НОВОЕ: получи бесплатно на aistudio.google.com
+GEMINI_KEY = os.environ.get("AIzaSyCaK7T5BDWW1iChKzCegEbXKqHhwA1-gy0", "")  # НОВОЕ: получи бесплатно на aistudio.google.com
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
