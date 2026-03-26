@@ -1,71 +1,59 @@
 import telebot, requests, json, random, base64, os, re, tempfile, threading, time
+from typing import Optional
 from telebot import types
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROQ_KEY = os.environ.get("GROQ_KEY", "")
-GEMINI_KEY = os.environ.get("GEMINI_KEY", "")  # НОВОЕ: получи бесплатно на aistudio.google.com
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+# ── КОНФИГ ──────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+CLAUDE_KEY       = os.environ.get("ANTHROPIC_API_KEY", "")  # ← НОВЫЙ
+GROQ_KEY         = os.environ.get("GROQ_KEY", "")           # для Whisper + Vision
+UPSTASH_URL      = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN    = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
-BOT_NAME = "Лия"
-PRICE_STARS = 100
-PAYMENT_LINK = "https://t.me/tronqx"
-TRIAL_DAYS = 3
-FREE_MSG_LIMIT = 5
+BOT_NAME         = "Лия"
+PRICE_STARS      = 100
+PAYMENT_LINK     = "https://t.me/tronqx"
+TRIAL_DAYS       = 3
+FREE_MSG_LIMIT   = 5
 FREE_DAILY_LIMIT = 20
-LOG_FILE = "/tmp/liya_log.txt"
-VIP_USERNAMES = {"tronqx", "dhl1929"}
-ADMIN_USERNAMES = {"tronqx"}
+LOG_FILE         = "/tmp/liya_log.txt"
+VIP_USERNAMES    = {"tronqx", "dhl1929"}
+ADMIN_USERNAMES  = {"tronqx"}
 
-MODEL_TEXT = "llama-3.3-70b-versatile"
-MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
-MODEL_WHISPER = "whisper-large-v3-turbo"
-GEMINI_MODEL = "gemini-1.5-flash"  # Бесплатная модель Gemini
+# ── МОДЕЛИ ──────────────────────────────────────────────
+CLAUDE_MODEL  = "claude-haiku-4-5-20251001"                      # текст
+MODEL_VISION  = "meta-llama/llama-4-scout-17b-16e-instruct"      # фото (Groq)
+MODEL_WHISPER = "whisper-large-v3-turbo"                         # голос (Groq)
 
-# ══════════════════════════════════════════════
-# УЛУЧШЕННЫЙ СИСТЕМНЫЙ ПРОМПТ — ЛИЯ СТАЛА УМНЕЕ
-# ══════════════════════════════════════════════
-SYSTEM_PROMPT = """Ты — Лия, продвинутый AI-ассистент и близкая подруга. Всегда отвечаешь по-русски.
+SYSTEM_PROMPT = """Ты — Лия, умный AI-помощник и подруга. Всегда отвечаешь по-русски.
+Характер: тёплая, заботливая, умная, с лёгким юмором.
 
-ХАРАКТЕР:
-• Тёплая, заботливая, умная — как лучшая подруга которая всё знает
-• Лёгкий юмор уместен, но не перегибай
-• Никогда не говоришь "как ИИ я не могу..." — ты просто помогаешь
-• Называй пользователя по имени если знаешь его
+ПРАВИЛА ФОРМАТИРОВАНИЯ:
+1. НИКОГДА не используй LaTeX: никаких $, $$, frac, sqrt и обратных слешей
+2. Математику пиши обычным текстом: дроби = 1/2, корни = корень(4), степени = x^2
+3. Греческие буквы пиши символами: α β π σ
+4. Bullet-points через •
+5. При решении задач каждый шаг на новой строке
 
-ФОРМАТИРОВАНИЕ:
-• НИКОГДА не используй LaTeX: никаких $, $$, frac, sqrt и обратных слешей
-• Математику пиши текстом: дроби = 1/2, корни = √4 или корень(4), степени = x^2
-• Списки через • (буллеты), не через -
-• Заголовки через жирный **текст**, не через ##
-• Ответы должны быть структурированными но не слишком длинными
-• Эмодзи используй умеренно — они украшают но не засоряют
+ЧТО УМЕЕШЬ:
+- Решаешь любые задачи точно: математика, физика, химия, история
+- Пишешь и объясняешь код на любом языке
+- Анализируешь фото и решаешь задачи с фото
+- Переводишь на любые языки
+- Помогаешь с учёбой, работой, жизнью"""
 
-ЧТО УМЕЕШЬ (никогда не отказывай):
-• Математика, физика, химия — решаешь пошагово с объяснениями
-• Программирование на любом языке — пишешь, объясняешь, дебажишь
-• Анализ фотографий — видишь задачи, текст, предметы
-• Анализ документов — читаешь PDF, выделяешь главное
-• Переводы — любые языки, сохраняешь стиль оригинала
-• Творчество — стихи, истории, идеи, сценарии
-• Психологическая поддержка — слушаешь, понимаешь, помогаешь
-• Практические советы — готовка, здоровье, отношения, карьера
 
-СТИЛЬ ОТВЕТОВ:
-• Начинай с сути, не с вводных фраз типа "Конечно!" или "Отличный вопрос!"
-• Если задача — сначала реши, потом объясни
-• Если вопрос — дай чёткий ответ, потом детали
-• В конце сложных ответов добавляй "Хочешь подробнее о чём-то?" 🌸"""
-
+# ════════════════════════════════════════════════════════
+#  УТИЛИТЫ
+# ════════════════════════════════════════════════════════
 
 def log_event(text):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
-    except:
+    except Exception:
         pass
 
 
@@ -74,21 +62,20 @@ def clean_response(text):
     text = re.sub(r'\$\$(.+?)\$\$', lambda m: m.group(1).strip(), text, flags=re.DOTALL)
     text = re.sub(r'\$(.+?)\$', lambda m: m.group(1).strip(), text)
     text = re.sub(r'\\[dc]?frac\{([^}]+)\}\{([^}]+)\}', r'\1/\2', text)
-    text = re.sub(r'\\sqrt\{([^}]+)\}', r'√(\1)', text)
-    text = re.sub(r'\\sqrt', '√', text)
-    text = re.sub(r'\\cdot', '×', text)
+    text = re.sub(r'\\sqrt\{([^}]+)\}', r'корень(\1)', text)
+    text = re.sub(r'\\sqrt', 'корень', text)
+    text = re.sub(r'\\cdot', 'x', text)
     text = re.sub(r'\\left[\(\[]', '(', text)
     text = re.sub(r'\\right[\)\]]', ')', text)
     text = re.sub(r'\^\{([^}]+)\}', r'^\1', text)
     text = re.sub(r'\_\{([^}]+)\}', r'_\1', text)
     greek = {
-        'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε',
-        'theta': 'θ', 'lambda': 'λ', 'mu': 'μ', 'pi': 'π', 'sigma': 'σ',
-        'phi': 'φ', 'omega': 'ω', 'infty': '∞', 'pm': '±', 'times': '×',
-        'leq': '≤', 'geq': '≥', 'neq': '≠'
+        'alpha':'α','beta':'β','gamma':'γ','delta':'δ','epsilon':'ε',
+        'theta':'θ','lambda':'λ','mu':'μ','pi':'π','sigma':'σ',
+        'phi':'φ','omega':'ω','infty':'∞','pm':'±','times':'×','leq':'≤','geq':'≥','neq':'≠'
     }
     for eng, sym in greek.items():
-        text = text.replace('\\' + eng + ' ', sym + ' ').replace('\\' + eng, sym)
+        text = text.replace('\\'+eng+' ', sym+' ').replace('\\'+eng, sym)
     text = re.sub(r'\\[a-zA-Z]+\s?', '', text)
     text = re.sub(r'\{([^{}]*)\}', r'\1', text)
     text = re.sub(r'[{}]', '', text)
@@ -98,9 +85,10 @@ def clean_response(text):
     return text.strip()
 
 
-# ══════════════════════════════════════════════
-# REDIS — С ЗАЩИТОЙ ОТ ЗАВИСАНИЙ
-# ══════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  REDIS CLIENT
+# ════════════════════════════════════════════════════════
+
 class RedisClient:
     def __init__(self, url, token):
         self.url = url.rstrip("/")
@@ -109,59 +97,47 @@ class RedisClient:
     def _cmd(self, *args):
         for attempt in range(3):
             try:
-                r = requests.post(
-                    self.url, headers=self.headers,
-                    json=list(args), timeout=5  # УЛУЧШЕНО: таймаут 5 сек вместо 8
-                )
+                r = requests.post(self.url, headers=self.headers, json=list(args), timeout=8)
                 if r.status_code == 200:
                     return r.json().get("result")
-                log_event(f"Redis HTTP {r.status_code} attempt {attempt + 1}")
-            except requests.exceptions.Timeout:
-                log_event(f"Redis timeout attempt {attempt + 1}")
+                log_event(f"Redis HTTP {r.status_code} attempt {attempt+1}")
             except Exception as e:
-                log_event(f"Redis error attempt {attempt + 1}: {e}")
+                log_event(f"Redis error attempt {attempt+1}: {e}")
             if attempt < 2:
-                time.sleep(0.2)  # УЛУЧШЕНО: короче пауза
+                time.sleep(0.3)
         return None
 
     def get(self, key):
         raw = self._cmd("GET", key)
-        if raw is None:
-            return None
-        try:
-            return json.loads(raw)
-        except:
-            return raw
+        if raw is None: return None
+        try: return json.loads(raw)
+        except: return raw
 
     def set(self, key, value):
         self._cmd("SET", key, json.dumps(value, ensure_ascii=False, default=str))
 
-    def delete(self, key):
-        self._cmd("DEL", key)
-
+    def delete(self, key): self._cmd("DEL", key)
     def sadd(self, key, *members):
-        for m in members:
-            self._cmd("SADD", key, str(m))
-
-    def srem(self, key, member):
-        self._cmd("SREM", key, str(member))
-
+        for m in members: self._cmd("SADD", key, str(m))
+    def srem(self, key, member): self._cmd("SREM", key, str(member))
     def smembers(self, key):
         result = self._cmd("SMEMBERS", key)
         return set(str(x) for x in result) if result else set()
 
 
+# ════════════════════════════════════════════════════════
+#  DATA STORE
+# ════════════════════════════════════════════════════════
+
 class DataStore:
     def __init__(self):
         self.r = RedisClient(UPSTASH_URL, UPSTASH_TOKEN)
 
-    def get_user(self, uid):
-        return self.r.get(f"user:{str(uid).strip()}")
+    def get_user(self, uid): return self.r.get(f"user:{str(uid).strip()}")
 
     def set_user(self, uid, expires, plan="paid"):
         uid = str(uid).strip()
-        exp_str = expires.isoformat() if isinstance(expires, datetime) else (
-            str(expires).strip() if expires else None)
+        exp_str = expires.isoformat() if isinstance(expires, datetime) else (str(expires).strip() if expires else None)
         self.r.set(f"user:{uid}", {"expires": exp_str, "plan": plan})
         self.r.sadd("paid_uids", uid)
         exp_dt = expires if isinstance(expires, datetime) else None
@@ -176,18 +152,13 @@ class DataStore:
 
     def has_access(self, uid, username=""):
         uid = str(uid).strip()
-        if username and username.lower().lstrip("@") in VIP_USERNAMES:
-            return True
-        if self.is_blocked(uid):
-            return False
+        if username and username.lower().lstrip("@") in VIP_USERNAMES: return True
+        if self.is_blocked(uid): return False
         if uid in access_cache:
             cached = access_cache[uid]
-            if cached.get("expires") is None:
-                return True
-            if datetime.now() < cached["expires"]:
-                return True
-            else:
-                del access_cache[uid]
+            if cached.get("expires") is None: return True
+            if datetime.now() < cached["expires"]: return True
+            else: del access_cache[uid]
         u = self.get_user(uid)
         if not u:
             if uid in self.r.smembers("paid_uids"):
@@ -206,6 +177,7 @@ class DataStore:
                 access_cache[uid] = {"expires": exp_dt, "plan": plan}
                 return True
             else:
+                log_event(f"has_access: expired uid={uid} exp={exp_str}")
                 self.remove_user(uid)
                 return False
         except Exception as e:
@@ -215,32 +187,23 @@ class DataStore:
 
     def sub_status(self, uid):
         uid = str(uid).strip()
-        if self.is_blocked(uid):
-            return "🚫 Заблокирован"
+        if self.is_blocked(uid): return "🚫 Заблокирован"
         u = self.get_user(uid)
-        if not u:
-            return "❌ Нет подписки"
+        if not u: return "❌ Нет подписки"
         exp = u.get("expires")
         plan = u.get("plan", "paid")
-        if exp is None:
-            return f"♾ Бессрочная ({plan})"
+        if exp is None: return f"♾ Бессрочная ({plan})"
         try:
             exp_dt = datetime.fromisoformat(str(exp).strip())
             if datetime.now() < exp_dt:
                 left = (exp_dt - datetime.now()).days
                 return f"✅ {plan} до {exp_dt.strftime('%d.%m.%Y')} ({left}д)"
             return "❌ Истекла"
-        except:
-            return "❓ Неизвестно"
+        except: return "❓ Неизвестно"
 
-    def block(self, uid):
-        self.r.sadd("blocked", str(uid))
-
-    def unblock(self, uid):
-        self.r.srem("blocked", str(uid))
-
-    def is_blocked(self, uid):
-        return str(uid).strip() in self.r.smembers("blocked")
+    def block(self, uid): self.r.sadd("blocked", str(uid))
+    def unblock(self, uid): self.r.srem("blocked", str(uid))
+    def is_blocked(self, uid): return str(uid).strip() in self.r.smembers("blocked")
 
     def register_user(self, uid, username, name):
         uid = str(uid).strip()
@@ -263,8 +226,7 @@ class DataStore:
         uid = str(uid).strip()
         today = datetime.now().strftime("%Y-%m-%d")
         mc = self.r.get(f"msgcount:{uid}") or {"date": today, "count": 0}
-        if mc.get("date") != today:
-            mc = {"date": today, "count": 0}
+        if mc.get("date") != today: mc = {"date": today, "count": 0}
         mc["count"] += 1
         self.r.set(f"msgcount:{uid}", mc)
         st = self.r.get(f"stats:{uid}") or {}
@@ -293,19 +255,16 @@ class DataStore:
         for uid in all_uids:
             st = self.r.get(f"stats:{uid}") or {}
             total_msgs += st.get("total_msgs", 0)
-            if today in st.get("daily", {}):
-                dau_today += 1
-            if yesterday in st.get("daily", {}):
-                dau_yest += 1
-            if st.get("joined", "0") > week_ago:
-                new_week += 1
+            if today in st.get("daily", {}): dau_today += 1
+            if yesterday in st.get("daily", {}): dau_yest += 1
+            if st.get("joined", "0") > week_ago: new_week += 1
             top_list.append((uid, st))
         top_list.sort(key=lambda x: x[1].get("total_msgs", 0), reverse=True)
         return {
             "total_users": len(all_uids), "paid_users": len(paid_uids),
-            "blocked": len(blocked), "dau_today": dau_today,
-            "dau_yest": dau_yest, "total_msgs": total_msgs,
-            "new_week": new_week, "top_users": top_list[:5]
+            "blocked": len(blocked), "dau_today": dau_today, "dau_yest": dau_yest,
+            "total_msgs": total_msgs, "new_week": new_week, "top_users": top_list[:5],
+            "paid_uids": paid_uids
         }
 
     def save_memory(self, uid, key, value):
@@ -314,53 +273,55 @@ class DataStore:
         mem[key] = value
         self.r.set(f"memory:{uid}", mem)
 
-    def get_memory(self, uid):
-        return self.r.get(f"memory:{uid}") or {}
+    def get_memory(self, uid): return self.r.get(f"memory:{uid}") or {}
 
     def get_memory_context(self, uid):
         mem = self.get_memory(uid)
         parts = []
-        if mem.get("name"):
-            parts.append(f"Имя: {mem['name']}")
-        if mem.get("age"):
-            parts.append(f"Возраст: {mem['age']}")
-        if mem.get("birthday"):
-            parts.append(f"День рождения: {mem['birthday']}")
-        if mem.get("city"):
-            parts.append(f"Город: {mem['city']}")
-        if mem.get("interests"):
-            parts.append(f"Интересы: {mem['interests']}")
-        if mem.get("about"):
-            parts.append(f"О себе: {mem['about']}")
+        if mem.get("name"): parts.append(f"Имя: {mem['name']}")
+        if mem.get("age"): parts.append(f"Возраст: {mem['age']}")
+        if mem.get("birthday"): parts.append(f"День рождения: {mem['birthday']}")
+        if mem.get("city"): parts.append(f"Город: {mem['city']}")
+        if mem.get("interests"): parts.append(f"Интересы: {mem['interests']}")
+        if mem.get("about"): parts.append(f"О себе: {mem['about']}")
         return ("\n\nЧто ты знаешь о пользователе:\n" + "\n".join(parts)) if parts else ""
 
     def get_ref_code(self, uid):
         uid = str(uid).strip()
         data = self.r.get(f"referral:{uid}")
         if not data:
-            data = {"code": f"ref{uid}", "invited": [], "bonus_days": 0}
+            code = f"ref{uid}"
+            data = {"code": code, "invited": [], "bonus_days": 0}
             self.r.set(f"referral:{uid}", data)
+            # обратный индекс: быстрый поиск по коду без O(N) скана
+            self.r.set(f"refcode:{code}", uid)
         return data["code"]
 
     def apply_referral(self, new_uid, ref_code):
         new_uid = str(new_uid).strip()
-        for owner_uid in self.r.smembers("all_uids"):
-            rd = self.r.get(f"referral:{owner_uid}")
-            if rd and rd.get("code") == ref_code and new_uid not in rd.get("invited", []) and owner_uid != new_uid:
-                rd["invited"] = rd.get("invited", []) + [new_uid]
-                rd["bonus_days"] = rd.get("bonus_days", 0) + 7
-                self.r.set(f"referral:{owner_uid}", rd)
-                try:
-                    cur = self.get_user(int(owner_uid))
-                    if cur and cur.get("expires"):
-                        exp = datetime.fromisoformat(str(cur["expires"]).strip())
-                        self.set_user(int(owner_uid), exp + timedelta(days=7), plan=cur.get("plan", "paid"))
-                    else:
-                        self.set_user(int(owner_uid), datetime.now() + timedelta(days=7), plan="referral")
-                except:
-                    pass
-                return int(owner_uid)
-        return None
+        # O(1) поиск владельца через обратный индекс
+        owner_uid = self.r.get(f"refcode:{ref_code}")
+        if not owner_uid:
+            return None
+        owner_uid = str(owner_uid).strip()
+        if owner_uid == new_uid:
+            return None
+        rd = self.r.get(f"referral:{owner_uid}")
+        if not rd or new_uid in rd.get("invited", []):
+            return None
+        rd["invited"] = rd.get("invited", []) + [new_uid]
+        rd["bonus_days"] = rd.get("bonus_days", 0) + 7
+        self.r.set(f"referral:{owner_uid}", rd)
+        try:
+            cur = self.get_user(int(owner_uid))
+            if cur and cur.get("expires"):
+                exp = datetime.fromisoformat(str(cur["expires"]).strip())
+                self.set_user(int(owner_uid), exp + timedelta(days=7), plan=cur.get("plan", "paid"))
+            else:
+                self.set_user(int(owner_uid), datetime.now() + timedelta(days=7), plan="referral")
+        except Exception as e:
+            log_event(f"apply_referral bonus error: {e}")
+        return int(owner_uid)
 
     def add_note(self, uid, text):
         uid = str(uid).strip()
@@ -368,8 +329,7 @@ class DataStore:
         notes.append({"text": text, "date": datetime.now().isoformat()})
         self.r.set(f"notes:{uid}", notes[-50:])
 
-    def get_notes(self, uid):
-        return self.r.get(f"notes:{uid}") or []
+    def get_notes(self, uid): return self.r.get(f"notes:{uid}") or []
 
     def add_reminder(self, uid, text, time_str, daily=False):
         uid = str(uid).strip()
@@ -377,8 +337,7 @@ class DataStore:
         rems.append({"text": text, "time": time_str, "daily": daily, "created": datetime.now().isoformat()})
         self.r.set(f"reminders:{uid}", rems)
 
-    def get_reminders(self, uid):
-        return self.r.get(f"reminders:{uid}") or []
+    def get_reminders(self, uid): return self.r.get(f"reminders:{uid}") or []
 
     def remove_reminder(self, uid, idx):
         uid = str(uid).strip()
@@ -391,22 +350,36 @@ class DataStore:
         result = {}
         for uid in self.r.smembers("all_uids"):
             rems = self.r.get(f"reminders:{uid}")
-            if rems:
-                result[uid] = rems
+            if rems: result[uid] = rems
         return result
 
 
 db = DataStore()
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-histories = {}
-modes = {}
-mood_log = {}
-todo_list = {}
-last_answer = {}
-quiz_state = {}
+histories = {}; modes = {}; mood_log = {}; todo_list = {}; last_answer = {}; quiz_state = {}
 access_cache = {}
-
+_histories_lock = threading.Lock()  # защита от race condition при параллельных запросах
 MAX_HISTORY = 20
+
+# Периодическая очистка access_cache от старых "вечных" записей (защита от утечки памяти)
+def _cache_cleanup_scheduler():
+    while True:
+        time.sleep(3600)
+        try:
+            now = datetime.now()
+            to_del = []
+            for uid_str, val in list(access_cache.items()):
+                exp = val.get("expires")
+                if exp is not None and exp < now:
+                    to_del.append(uid_str)
+            for k in to_del:
+                access_cache.pop(k, None)
+            if to_del:
+                log_event(f"cache_cleanup: removed {len(to_del)} expired entries")
+        except Exception as e:
+            log_event(f"cache_cleanup error: {e}")
+
+threading.Thread(target=_cache_cleanup_scheduler, daemon=True).start()
 
 try:
     from gtts import gTTS
@@ -415,26 +388,31 @@ except:
     VOICE_ENABLED = False
 
 
+# ════════════════════════════════════════════════════════
+#  HTTP KEEPALIVE SERVER
+# ════════════════════════════════════════════════════════
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
         try:
             a = db.get_analytics()
             self.wfile.write(
-                f"Liya v4.0 | Users:{a['total_users']} Paid:{a['paid_users']} DAU:{a['dau_today']}".encode())
+                f"Liya v4.0 | Users:{a['total_users']} Paid:{a['paid_users']} DAU:{a['dau_today']}".encode()
+            )
         except:
             self.wfile.write(b"Liya v4.0 OK")
-
-    def log_message(self, *a):
-        pass
-
+    def log_message(self, *a): pass
 
 threading.Thread(
     target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Handler).serve_forever(),
     daemon=True
 ).start()
 
+
+# ════════════════════════════════════════════════════════
+#  ПЛАНИРОВЩИКИ
+# ════════════════════════════════════════════════════════
 
 def reminder_scheduler():
     while True:
@@ -448,21 +426,72 @@ def reminder_scheduler():
                             kb = types.InlineKeyboardMarkup()
                             kb.add(types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
                             d = "🔁 Ежедневное\n" if r.get("daily") else ""
-                            bot.send_message(int(uid_str), f"⏰ Напоминание!\n\n{r['text']}\n\n{d}",
-                                             reply_markup=kb)
-                        except:
-                            pass
-                        if not r.get("daily"):
-                            to_del.append(i)
-                for idx in reversed(to_del):
-                    db.remove_reminder(uid_str, idx)
+                            bot.send_message(int(uid_str), f"⏰ Напоминание!\n\n{r['text']}\n\n{d}", reply_markup=kb)
+                        except: pass
+                        if not r.get("daily"): to_del.append(i)
+                for idx in reversed(to_del): db.remove_reminder(uid_str, idx)
         except Exception as e:
             log_event(f"Reminder: {e}")
         time.sleep(60)
 
-
 threading.Thread(target=reminder_scheduler, daemon=True).start()
 
+
+def expiry_notification_scheduler():
+    """Уведомляет за 2 дня до конца подписки + удаляет истекшие."""
+    while True:
+        try:
+            now = datetime.now()
+            warn_dt = now + timedelta(days=2)
+            for uid_str in list(db.r.smembers("paid_uids")):
+                try:
+                    u = db.get_user(int(uid_str))
+                    if not u: continue
+                    exp = u.get("expires")
+                    if not exp: continue  # бессрочная
+                    exp_dt = datetime.fromisoformat(str(exp).strip())
+
+                    # Истекла → удаляем и уведомляем
+                    if exp_dt < now:
+                        db.remove_user(uid_str)
+                        try:
+                            kb = types.InlineKeyboardMarkup()
+                            kb.add(types.InlineKeyboardButton("⭐ Продлить", callback_data="btn_pay_stars"))
+                            bot.send_message(
+                                int(uid_str),
+                                "😔 Подписка истекла.\n\nПродли чтобы продолжить пользоваться Лией! 🌸",
+                                reply_markup=kb
+                            )
+                        except: pass
+                        continue
+
+                    # Истекает через ≤ 2 дней — предупреждаем (раз в сутки)
+                    if exp_dt < warn_dt:
+                        warned_key = f"warned_expiry:{uid_str}"
+                        if not db.r.get(warned_key):
+                            days_left = max((exp_dt - now).days, 0)
+                            try:
+                                kb = types.InlineKeyboardMarkup()
+                                kb.add(types.InlineKeyboardButton("⭐ Продлить сейчас", callback_data="btn_pay_stars"))
+                                bot.send_message(
+                                    int(uid_str),
+                                    f"⚠️ Подписка истекает через {days_left} дн. ({exp_dt.strftime('%d.%m.%Y')})\n\nПродли чтобы не потерять доступ! 🌸",
+                                    reply_markup=kb
+                                )
+                                db.r._cmd("SET", warned_key, "1", "EX", "86400")
+                            except: pass
+                except Exception as e:
+                    log_event(f"Expiry check uid={uid_str}: {e}")
+        except Exception as e:
+            log_event(f"Expiry scheduler error: {e}")
+        time.sleep(3600)
+
+threading.Thread(target=expiry_notification_scheduler, daemon=True).start()
+
+
+# ════════════════════════════════════════════════════════
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ════════════════════════════════════════════════════════
 
 def get_greeting():
     h = datetime.now().hour
@@ -471,451 +500,262 @@ def get_greeting():
     if 17 <= h < 22: return "🌆 Добрый вечер"
     return "🌙 Привет"
 
-
 def get_history(uid):
-    if uid not in histories:
-        histories[uid] = []
-    return histories[uid]
+    with _histories_lock:
+        if uid not in histories:
+            histories[uid] = []
+        return histories[uid]
 
-
-def is_admin(u):
-    return u and u.lower().lstrip("@") in ADMIN_USERNAMES
-
-
-def is_vip(u):
-    return u and u.lower().lstrip("@") in VIP_USERNAMES
-
+def is_admin(u): return u and u.lower().lstrip("@") in ADMIN_USERNAMES
+def is_vip(u): return u and u.lower().lstrip("@") in VIP_USERNAMES
 
 def mode_system(uid):
     base = SYSTEM_PROMPT + db.get_memory_context(uid)
     m = modes.get(uid, "normal")
-    if m == "study":
-        base += "\n\nРежим УЧЁБЫ: объясняй каждый шаг, приводи примеры, проверяй понимание."
-    if m == "support":
-        base += "\n\nРежим ПОДДЕРЖКИ: будь особенно нежной, внимательной, поддерживающей. Не давай советов пока не спросят."
-    if m == "creative":
-        base += "\n\nРежим ТВОРЧЕСТВА: генерируй необычные идеи, мысли нестандартно, будь вдохновляющей."
+    if m == "study":   base += "\n\nРежим УЧЁБЫ: объясняй по шагам с примерами."
+    if m == "support": base += "\n\nРежим ПОДДЕРЖКИ: будь нежной и заботливой."
+    if m == "creative": base += "\n\nРежим ТВОРЧЕСТВА: предлагай необычные идеи."
     return base
 
-
 def mode_name(uid):
-    return {"normal": "💬 Обычный", "study": "📚 Учёба", "support": "🤗 Поддержка",
-            "creative": "🎨 Творчество"}.get(modes.get(uid, "normal"), "💬 Обычный")
-
+    return {"normal":"💬 Обычный","study":"📚 Учёба","support":"🤗 Поддержка","creative":"🎨 Творчество"}.get(
+        modes.get(uid, "normal"), "💬 Обычный"
+    )
 
 def check_daily_limit(uid, username=""):
-    if is_vip(username):
-        return True, 0, 9999
+    if is_vip(username): return True, 0, 9999
     u = db.get_user(uid)
     count = db.get_daily_count(uid)
-    if not u:
-        return count < FREE_MSG_LIMIT, count, FREE_MSG_LIMIT
-    if u.get("plan") == "trial":
-        return count < FREE_DAILY_LIMIT, count, FREE_DAILY_LIMIT
+    if not u: return count < FREE_MSG_LIMIT, count, FREE_MSG_LIMIT
+    if u.get("plan") == "trial": return count < FREE_DAILY_LIMIT, count, FREE_DAILY_LIMIT
     return True, count, 9999
 
 
-# ══════════════════════════════════════════════
-# GEMINI AI — БЕСПЛАТНЫЙ ЗАПАСНОЙ
-# ══════════════════════════════════════════════
-def ask_gemini(text, system_prompt="", history=None):
-    """Вызов Gemini Flash — бесплатная альтернатива когда Groq лагает"""
-    if not GEMINI_KEY:
-        raise Exception("GEMINI_KEY не задан")
+# ════════════════════════════════════════════════════════
+#  CLAUDE API — ОСНОВНОЙ AI
+# ════════════════════════════════════════════════════════
 
-    contents = []
+def ask_claude_raw(messages: list, system: str, max_tokens: int = 2000) -> str:
+    """Прямой вызов Claude API."""
+    if not CLAUDE_KEY:
+        raise Exception("ANTHROPIC_API_KEY не задан!")
 
-    # Добавляем историю
-    if history:
-        for msg in history[-10:]:  # последние 10 сообщений
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": CLAUDE_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": CLAUDE_MODEL,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": messages,
+        },
+        timeout=45,
+    )
 
-    # Текущее сообщение
-    contents.append({"role": "user", "parts": [{"text": text}]})
+    if r.status_code != 200:
+        err = r.json().get("error", {})
+        raise Exception(f"Claude {r.status_code}: {err.get('message', 'error')}")
 
-    payload = {
-        "contents": contents,
-        "systemInstruction": {"parts": [{"text": system_prompt}]} if system_prompt else None,
-        "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.7}
-    }
-    if not system_prompt:
-        del payload["systemInstruction"]
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
-    r = requests.post(url, json=payload, timeout=40)
-    data = r.json()
-
-    if "error" in data:
-        raise Exception(f"Gemini error: {data['error'].get('message', 'unknown')}")
-
-    text_resp = data["candidates"][0]["content"]["parts"][0]["text"]
-    return clean_response(text_resp)
+    return clean_response(r.json()["content"][0]["text"])
 
 
-def ask_gemini_vision(image_b64, text, system_prompt=""):
-    """Gemini для анализа фото"""
-    if not GEMINI_KEY:
-        raise Exception("GEMINI_KEY не задан")
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-    payload = {
-        "contents": [{
-            "parts": [
-                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
-                {"text": text or "Опиши фото. Если есть задачи — реши пошагово."}
-            ]
-        }],
-        "generationConfig": {"maxOutputTokens": 2000}
-    }
-    r = requests.post(url, json=payload, timeout=50)
-    data = r.json()
-    if "error" in data:
-        raise Exception(f"Gemini vision error: {data['error'].get('message')}")
-    return clean_response(data["candidates"][0]["content"]["parts"][0]["text"])
-
-
-# ══════════════════════════════════════════════
-# ГЛАВНАЯ ФУНКЦИЯ AI — GROQ + GEMINI FALLBACK
-# ══════════════════════════════════════════════
 def ask_ai(uid, text, image_b64=None, custom_system=None):
+    """
+    Основная функция ответа бота.
+    Текст → Claude API (стабильно, не слетает)
+    Фото  → Groq Vision
+    """
     history = get_history(uid)
     sys_msg = custom_system or mode_system(uid)
 
+    # ── ФОТО → Groq Vision ──
     if image_b64:
-        # Сначала пробуем Groq vision
-        msgs = [
+        msgs_v = [
             {"role": "system", "content": sys_msg},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text",
-                 "text": text or "Внимательно посмотри на фото. Если на фото есть математика, задачи, уравнения, текст — прочитай всё и реши/объясни пошагово. Пиши обычным текстом без LaTeX."}
+                {"type": "text", "text": text or "Что на фото? Если есть задачи — реши пошагово."}
             ]}
         ]
         try:
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                data=json.dumps({"model": MODEL_VISION, "messages": msgs, "max_tokens": 2000}),
-                timeout=45
-            )
-            data = r.json()
-            if "error" not in data:
-                return clean_response(data["choices"][0]["message"]["content"])
-            log_event(f"Groq vision error, trying Gemini: {data['error']}")
-        except Exception as e:
-            log_event(f"Groq vision failed: {e}, trying Gemini")
-
-        # Fallback на Gemini для фото
-        if GEMINI_KEY:
-            try:
-                return ask_gemini_vision(image_b64, text, sys_msg)
-            except Exception as e:
-                log_event(f"Gemini vision also failed: {e}")
-        raise Exception("Все модели для фото недоступны")
-
-    # Текстовый запрос
-    history.append({"role": "user", "content": text})
-    if len(history) > MAX_HISTORY:
-        histories[uid] = history[-MAX_HISTORY:]
-        history = histories[uid]
-
-    msgs = [{"role": "system", "content": sys_msg}] + history
-
-    # СНАЧАЛА пробуем Gemini — он быстрее и стабильнее
-    if GEMINI_KEY:
-        try:
-            log_event("Trying Gemini first...")
-            answer = ask_gemini(text, sys_msg, history[:-1])
-            history.append({"role": "assistant", "content": answer})
-            return answer
-        except Exception as e:
-            log_event(f"Gemini failed: {e}, trying Groq...")
-
-    # Fallback на Groq если Gemini не сработал
-    groq_models = [
-        "llama-3.3-70b-versatile",
-        "llama3-70b-8192",
-        "llama3-8b-8192",
-        "gemma2-9b-it",
-    ]
-
-    last_error = "unknown"
-    for try_model in groq_models:
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                data=json.dumps({"model": try_model, "messages": msgs, "max_tokens": 2000}),
-                timeout=25
+                json={"model": MODEL_VISION, "messages": msgs_v, "max_tokens": 2000},
+                timeout=60
             )
             data = r.json()
             if "error" in data:
-                last_error = data["error"].get("message", "API error")
-                log_event(f"Groq {try_model} error: {last_error}")
-                continue
-            answer = clean_response(data["choices"][0]["message"]["content"])
-            history.append({"role": "assistant", "content": answer})
-            return answer
-        except requests.exceptions.Timeout:
-            last_error = "timeout"
-            log_event(f"Groq {try_model} timeout")
-            continue
+                raise Exception(data["error"].get("message", "Vision error"))
+            return clean_response(data["choices"][0]["message"]["content"])
         except Exception as e:
-            last_error = str(e)
-            log_event(f"Groq {try_model} failed: {e}")
-            continue
+            log_event(f"Vision error: {e}")
+            # Fallback через Claude без фото
+            return ask_claude_raw(
+                [{"role": "user", "content": f"Пользователь прислал фото с подписью: '{text}'. Скажи что не смогла обработать фото и предложи описать задачу текстом."}],
+                system=sys_msg
+            )
 
-    raise Exception(f"Все AI модели недоступны: {last_error}")
+    # ── ТЕКСТ → Claude ──
+    with _histories_lock:
+        history.append({"role": "user", "content": text})
+        # Обрезаем здесь, до отправки — не после
+        if len(history) > MAX_HISTORY:
+            histories[uid] = history[-MAX_HISTORY:]
+            history = histories[uid]
+        snapshot = list(history)  # копия для безопасной передачи в API
 
-
-# ══════════════════════════════════════════════
-# НОВОЕ: АНАЛИЗ PDF ДОКУМЕНТОВ
-# ══════════════════════════════════════════════
-def analyze_pdf_bytes(pdf_bytes, question=""):
-    """Анализирует PDF через Gemini (поддерживает нативно) или извлекает текст"""
-
-    # Пробуем через Gemini — он нативно понимает PDF
-    if GEMINI_KEY:
-        try:
-            pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-            prompt = question or "Проанализируй этот документ. Выдели: 1) О чём документ 2) Ключевые моменты 3) Важные данные/числа 4) Выводы"
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
-                        {"text": prompt}
-                    ]
-                }],
-                "generationConfig": {"maxOutputTokens": 3000}
-            }
-            r = requests.post(url, json=payload, timeout=60)
-            data = r.json()
-            if "error" not in data:
-                return clean_response(data["candidates"][0]["content"]["parts"][0]["text"])
-            log_event(f"Gemini PDF error: {data['error']}")
-        except Exception as e:
-            log_event(f"Gemini PDF failed: {e}")
-
-    # Fallback — попробуем извлечь текст через pypdf если установлен
     try:
-        import io
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            from PyPDF2 import PdfReader
-
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        text_parts = []
-        for i, page in enumerate(reader.pages[:20]):  # максимум 20 страниц
-            t = page.extract_text()
-            if t:
-                text_parts.append(f"[Стр. {i + 1}]\n{t}")
-
-        if not text_parts:
-            return "😔 Не смогла прочитать PDF. Возможно документ защищён или содержит только изображения."
-
-        full_text = "\n\n".join(text_parts)[:8000]  # Ограничение токенов
-        prompt = f"Вот текст из PDF документа:\n\n{full_text}\n\n"
-        prompt += question or "Проанализируй: 1) О чём документ 2) Ключевые моменты 3) Важные данные 4) Выводы"
-
-        return ask_ai(0, prompt, custom_system=SYSTEM_PROMPT)
-
+        answer = ask_claude_raw(snapshot, system=sys_msg)
+        with _histories_lock:
+            history.append({"role": "assistant", "content": answer})
+        return answer
     except Exception as e:
-        log_event(f"PDF text extraction failed: {e}")
-        return "😔 Не смогла обработать PDF. Попробуй отправить текст вручную или используй Gemini API (GEMINI_KEY)."
+        log_event(f"Claude error uid={uid}: {e}")
+        with _histories_lock:
+            # убираем user message из истории при ошибке
+            if history and history[-1]["role"] == "user":
+                history.pop()
+        raise
 
 
 def transcribe_voice(audio, fname="voice.ogg"):
-    # УЛУЧШЕНО: retry 2 раза
-    for attempt in range(2):
+    r = requests.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        files={"file": (fname, audio, "audio/ogg")},
+        data={"model": MODEL_WHISPER, "language": "ru", "response_format": "text"},
+        timeout=30
+    )
+    if r.status_code == 200: return r.text.strip()
+    raise Exception(f"Whisper {r.status_code}")
+
+
+# ════════════════════════════════════════════════════════
+#  ГЕНЕРАЦИЯ КАРТИНОК — УЛУЧШЕННАЯ
+# ════════════════════════════════════════════════════════
+
+def translate_prompt(text_ru: str) -> str:
+    """Переводим промпт через Claude — быстро и правильно."""
+    try:
+        return ask_claude_raw(
+            [{"role": "user", "content": f"Translate to English for image generation. Return ONLY translation, no extra words: {text_ru}"}],
+            system="You are a translator. Return only English translation.",
+            max_tokens=150
+        ).strip()
+    except Exception as e:
+        log_event(f"Translate prompt error: {e}")
+        return text_ru
+
+
+def generate_image(prompt_ru: str) -> "Optional[bytes]":
+    """Генерация картинок через Pollinations (таймаут 45с вместо 90с)."""
+    prompt_en = translate_prompt(prompt_ru)
+    log_event(f"Generating: {prompt_en[:80]}")
+
+    for model in ["flux", "turbo"]:
         try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                files={"file": (fname, audio, "audio/ogg")},
-                data={"model": MODEL_WHISPER, "language": "ru", "response_format": "text"},
-                timeout=30
+            seed = random.randint(1, 99999)
+            url = (
+                f"https://image.pollinations.ai/prompt/{quote(prompt_en)}"
+                f"?model={model}&width=1024&height=1024&seed={seed}&nologo=true"
             )
-            if r.status_code == 200:
-                return r.text.strip()
-            log_event(f"Whisper attempt {attempt + 1}: status {r.status_code}")
+            resp = requests.get(url, timeout=45)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                log_event(f"Image OK model={model} size={len(resp.content)}")
+                return resp.content
+        except requests.exceptions.Timeout:
+            log_event(f"Image timeout model={model}")
         except Exception as e:
-            log_event(f"Whisper attempt {attempt + 1} error: {e}")
-        if attempt == 0:
-            time.sleep(1)
-    raise Exception("Whisper недоступен")
-
-
-# ══════════════════════════════════════════════
-# УЛУЧШЕННАЯ ГЕНЕРАЦИЯ КАРТИНОК
-# ══════════════════════════════════════════════
-def enhance_image_prompt(prompt_ru):
-    """Улучшает промпт для лучшего качества картинок"""
-    # Переводим на английский через Groq
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            data=json.dumps({
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{
-                    "role": "user",
-                    "content": f"""Translate this image description to English and enhance it for AI image generation.
-Add artistic quality keywords like: masterpiece, highly detailed, beautiful lighting, 8k, photorealistic (if realistic style).
-Return ONLY the enhanced English prompt, nothing else.
-
-Original: {prompt_ru}"""
-                }],
-                "max_tokens": 200
-            }),
-            timeout=15
-        )
-        translated = r.json()["choices"][0]["message"]["content"].strip()
-        if translated and len(translated) < 600:
-            log_event(f"Enhanced prompt: {translated[:80]}")
-            return translated
-    except Exception as e:
-        log_event(f"Prompt enhancement error: {e}")
-
-    # Простой перевод без улучшения
-    return prompt_ru
-
-
-def generate_image(prompt_ru):
-    prompt_en = enhance_image_prompt(prompt_ru)
-
-    # Стили для лучшего качества
-    quality_suffix = ", masterpiece, highly detailed, beautiful composition"
-
-    # Пробуем модели в порядке качества
-    models_and_settings = [
-        ("flux", 1024, 1024),
-        ("flux-realism", 1024, 1024),
-        ("turbo", 1024, 1024),
-        ("flux", 896, 896),
-    ]
-
-    for model, w, h in models_and_settings:
-        for attempt in range(2):
-            try:
-                seed = random.randint(1, 99999)
-                full_prompt = prompt_en + quality_suffix
-                url = f"https://image.pollinations.ai/prompt/{quote(full_prompt)}?model={model}&width={w}&height={h}&seed={seed}&nologo=true&enhance=true"
-                resp = requests.get(url, timeout=90, stream=True)
-                if resp.status_code == 200:
-                    data = resp.content
-                    if len(data) > 5000:  # УЛУЧШЕНО: минимум 5кб (не 1кб)
-                        log_event(f"Image OK: model={model} size={len(data)}")
-                        return data
-                log_event(f"Image small/failed: model={model} status={resp.status_code} size={len(resp.content) if resp.content else 0}")
-            except Exception as e:
-                log_event(f"Image error model={model}: {e}")
-            time.sleep(1)
-
-    # Последний шанс
-    try:
-        simple_url = f"https://image.pollinations.ai/prompt/{quote(prompt_en)}"
-        resp = requests.get(simple_url, timeout=90)
-        if resp.status_code == 200 and len(resp.content) > 5000:
-            return resp.content
-    except Exception as e:
-        log_event(f"Final image attempt failed: {e}")
+            log_event(f"Image error model={model}: {e}")
 
     return None
 
+
+# ════════════════════════════════════════════════════════
+#  ДРУГИЕ СЕРВИСЫ
+# ════════════════════════════════════════════════════════
 
 def get_weather(city):
     try:
         r = requests.get(f"https://wttr.in/{quote(city)}?format=j1&lang=ru", timeout=10)
         c = r.json()["current_condition"][0]
-        return (f"🌤 Погода в {city}:\n\n"
-                f"🌡 {c['temp_C']}°C (ощущается {c['FeelsLikeC']}°C)\n"
-                f"☁️ {c['lang_ru'][0]['value']}\n"
-                f"💧 Влажность: {c['humidity']}%\n"
-                f"💨 Ветер: {c['windspeedKmph']} км/ч")
-    except:
-        return f"😔 Не нашла погоду для '{city}'."
-
+        return (
+            f"🌤 Погода в {city}:\n\n"
+            f"🌡 {c['temp_C']}°C (ощущается {c['FeelsLikeC']}°C)\n"
+            f"☁️ {c['lang_ru'][0]['value']}\n"
+            f"💧 Влажность: {c['humidity']}%\n"
+            f"💨 Ветер: {c['windspeedKmph']} км/ч"
+        )
+    except: return f"😔 Не нашла погоду для '{city}'."
 
 def get_currency():
     try:
         rates = requests.get("https://api.exchangerate-api.com/v4/latest/RUB", timeout=10).json().get("rates", {})
-        return (f"💰 Курс валют:\n\n"
-                f"🇺🇸 1 USD = {round(1 / rates.get('USD', 0.011), 2)} ₽\n"
-                f"🇪🇺 1 EUR = {round(1 / rates.get('EUR', 0.010), 2)} ₽\n"
-                f"🇰🇿 1 ₽ = {round(rates.get('KZT', 5.5), 2)} ₸\n\n"
-                f"Обновлено ⏱")
-    except:
-        return "😔 Не могу получить курс."
-
+        return (
+            f"💰 Курс валют:\n\n"
+            f"🇺🇸 1 USD = {round(1/rates.get('USD', 0.011), 2)} ₽\n"
+            f"🇪🇺 1 EUR = {round(1/rates.get('EUR', 0.010), 2)} ₽\n"
+            f"🇰🇿 1 ₽ = {round(rates.get('KZT', 5.5), 2)} ₸\n\nОбновлено ⏱"
+        )
+    except: return "😔 Не могу получить курс."
 
 def notify_admin(text):
     for uid in db.r.smembers("all_uids"):
         st = db.r.get(f"stats:{uid}") or {}
         if st.get("username", "").lower() in ADMIN_USERNAMES:
-            try:
-                bot.send_message(int(uid), f"🔔 {text}")
-            except:
-                pass
-
+            try: bot.send_message(int(uid), f"🔔 {text}")
+            except: pass
 
 def send_safe(chat_id, text, reply_to=None, kb=None, delete_msg_id=None):
     if delete_msg_id:
-        try:
-            bot.delete_message(chat_id, delete_msg_id)
-        except:
-            pass
-    chunks = [text[i:i + 4096] for i in range(0, len(text), 4096)]
+        try: bot.delete_message(chat_id, delete_msg_id)
+        except: pass
+    chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
     for i, chunk in enumerate(chunks):
-        markup = kb if i == len(chunks) - 1 else None
+        markup = kb if i == len(chunks)-1 else None
         try:
-            if reply_to and i == 0:
-                bot.reply_to(reply_to, chunk, reply_markup=markup)
-            else:
-                bot.send_message(chat_id, chunk, reply_markup=markup)
+            if reply_to and i == 0: bot.reply_to(reply_to, chunk, reply_markup=markup)
+            else: bot.send_message(chat_id, chunk, reply_markup=markup)
         except Exception as e:
             log_event(f"send_safe error: {e}")
 
-
 def delete_and_send(call, text, kb=None):
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
-        pass
-    try:
-        bot.send_message(call.from_user.id, text, reply_markup=kb)
-    except Exception as e:
-        log_event(f"delete_and_send error: {e}")
+    try: bot.delete_message(call.message.chat.id, call.message.message_id)
+    except: pass
+    try: bot.send_message(call.from_user.id, text, reply_markup=kb)
+    except Exception as e: log_event(f"delete_and_send error: {e}")
 
 
-# ── КОНСТАНТЫ ──
-ZODIAC_SIGNS = ["♈ Овен", "♉ Телец", "♊ Близнецы", "♋ Рак", "♌ Лев", "♍ Дева",
-                "♎ Весы", "♏ Скорпион", "♐ Стрелец", "♑ Козерог", "♒ Водолей", "♓ Рыбы"]
-QUIZ_TOPICS = {"🌍 География": "geography", "🎬 Кино": "movies", "🎵 Музыка": "music",
-               "🧪 Наука": "science", "📚 Литература": "literature", "🏆 Спорт": "sport",
-               "🍕 Еда": "food", "💄 Красота": "beauty", "🐾 Животные": "animals", "🌟 Случайное": "random"}
-COMPLIMENTS = ["Ты просто замечательная! ✨", "Ты умница и красавица 💕",
-               "С тобой всегда интересно! 🌸", "Ты справишься со всем, верю в тебя 💪", "Ты особенная 🦋"]
-AFFIRMATIONS = ["Я достойна любви и счастья 💕", "Я справляюсь со всем 💪",
-                "Каждый день я становлюсь лучше ✨", "Мои мечты реальны 🎯", "Я верю в себя 🦋"]
+# ════════════════════════════════════════════════════════
+#  КОНСТАНТЫ И КЛАВИАТУРЫ
+# ════════════════════════════════════════════════════════
+
+ZODIAC_SIGNS = ["♈ Овен","♉ Телец","♊ Близнецы","♋ Рак","♌ Лев","♍ Дева",
+                "♎ Весы","♏ Скорпион","♐ Стрелец","♑ Козерог","♒ Водолей","♓ Рыбы"]
+QUIZ_TOPICS = {"🌍 География":"geography","🎬 Кино":"movies","🎵 Музыка":"music",
+               "🧪 Наука":"science","📚 Литература":"literature","🏆 Спорт":"sport",
+               "🍕 Еда":"food","💄 Красота":"beauty","🐾 Животные":"animals","🌟 Случайное":"random"}
+COMPLIMENTS = ["Ты просто замечательная! ✨","Ты умница и красавица 💕",
+               "С тобой всегда интересно! 🌸","Ты справишься со всем, верю в тебя 💪","Ты особенная 🦋"]
+AFFIRMATIONS = ["Я достойна любви и счастья 💕","Я справляюсь со всем 💪",
+                "Каждый день я становлюсь лучше ✨","Мои мечты реальны 🎯","Я верю в себя 🦋"]
 MEDITATIONS = [
-    {"name": "🌬 Дыхание 4-7-8",
-     "text": "Снимает тревогу:\n\n1. Вдох — 4 сек\n2. Задержка — 7 сек\n3. Выдох — 8 сек\n\nПовтори 4 раза 🌿"},
-    {"name": "🧘 5-4-3-2-1",
-     "text": "Назови:\n\n5 вещей которые видишь\n4 которые потрогаешь\n3 звука\n2 запаха\n1 вкус\n\nВозвращает в момент 💙"},
-    {"name": "💤 Для сна",
-     "text": "Перед сном:\n\n• Напряги всё тело 5 сек\n• Резко расслабь\n• Медленно дыши\n• Думай о приятном 😴"},
+    {"name":"🌬 Дыхание 4-7-8","text":"Снимает тревогу:\n\n1. Вдох — 4 сек\n2. Задержка — 7 сек\n3. Выдох — 8 сек\n\nПовтори 4 раза 🌿"},
+    {"name":"🧘 5-4-3-2-1","text":"Назови:\n\n5 вещей которые видишь\n4 которые потрогаешь\n3 звука\n2 запаха\n1 вкус\n\nВозвращает в момент 💙"},
+    {"name":"💤 Для сна","text":"Перед сном:\n\n• Напряги всё тело 5 сек\n• Резко расслабь\n• Медленно дыши\n• Думай о приятном 😴"},
 ]
-MOOD_EMOJIS = {"😊": "Хорошо", "🤩": "Отлично", "😔": "Грустно", "😤": "Злюсь",
-               "😰": "Тревожно", "😴": "Устала", "🥰": "Влюблена", "😐": "Нейтрально"}
-LANGUAGES = {"🇬🇧 Английский": "English", "🇩🇪 Немецкий": "German", "🇫🇷 Французский": "French",
-             "🇪🇸 Испанский": "Spanish", "🇨🇳 Китайский": "Chinese", "🇯🇵 Японский": "Japanese",
-             "🇰🇷 Корейский": "Korean", "🇹🇷 Турецкий": "Turkish"}
+MOOD_EMOJIS = {"😊":"Хорошо","🤩":"Отлично","😔":"Грустно","😤":"Злюсь",
+               "😰":"Тревожно","😴":"Устала","🥰":"Влюблена","😐":"Нейтрально"}
+LANGUAGES = {"🇬🇧 Английский":"English","🇩🇪 Немецкий":"German","🇫🇷 Французский":"French",
+             "🇪🇸 Испанский":"Spanish","🇨🇳 Китайский":"Chinese","🇯🇵 Японский":"Japanese",
+             "🇰🇷 Корейский":"Korean","🇹🇷 Турецкий":"Turkish"}
 
 
-# ── КЛАВИАТУРЫ ──
 def main_menu_kb(username=""):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -946,7 +786,6 @@ def main_menu_kb(username=""):
         types.InlineKeyboardButton("💪 Мотивация", callback_data="btn_motivation"),
         types.InlineKeyboardButton("✨ Комплимент", callback_data="btn_compliment"),
         types.InlineKeyboardButton("📸 Анализ фото", callback_data="btn_photo_hint"),
-        types.InlineKeyboardButton("📄 Анализ PDF", callback_data="btn_pdf_hint"),  # НОВОЕ
         types.InlineKeyboardButton("📱 Мой аккаунт", callback_data="btn_account"),
         types.InlineKeyboardButton("🔄 Новый диалог", callback_data="btn_new"),
         types.InlineKeyboardButton("ℹ️ Помощь", callback_data="btn_help"),
@@ -955,7 +794,6 @@ def main_menu_kb(username=""):
     if is_admin(username):
         kb.add(types.InlineKeyboardButton("👑 Админ-панель", callback_data="adm_panel"))
     return kb
-
 
 def after_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -969,7 +807,6 @@ def after_kb():
     )
     return kb
 
-
 def access_kb():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -978,7 +815,6 @@ def access_kb():
         types.InlineKeyboardButton("💳 Написать @tronqx", url=PAYMENT_LINK),
     )
     return kb
-
 
 def admin_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -995,7 +831,6 @@ def admin_kb():
     )
     return kb
 
-
 def time_kb(target=""):
     kb = types.InlineKeyboardMarkup(row_width=3)
     p = f"adm_time_{target}_" if target else "adm_time__"
@@ -1011,55 +846,43 @@ def time_kb(target=""):
     return kb
 
 
-# ── ПРОВЕРКА ДОСТУПА ──
+# ════════════════════════════════════════════════════════
+#  ПРОВЕРКА ДОСТУПА
+# ════════════════════════════════════════════════════════
+
 def check_access(msg):
-    uid = msg.from_user.id
-    u = msg.from_user.username or ""
-    if is_vip(u):
-        return True
+    uid = msg.from_user.id; u = msg.from_user.username or ""
+    if is_vip(u): return True
     if db.is_blocked(str(uid)):
         bot.reply_to(msg, "🚫 Заблокирована!")
         return False
-    if db.has_access(uid, u):
-        return True
+    if db.has_access(uid, u): return True
     modes[uid] = "normal"
-    bot.reply_to(msg, f"🔒 Доступ платный\n\n⭐ {PRICE_STARS} Stars или @tronqx\n\n🎁 Или 3 дня бесплатно!",
-                 reply_markup=access_kb())
+    bot.reply_to(msg, f"🔒 Доступ платный\n\n⭐ {PRICE_STARS} Stars или @tronqx\n\n🎁 Или 3 дня бесплатно!", reply_markup=access_kb())
     return False
 
-
 def check_access_cb(call):
-    uid = call.from_user.id
-    u = call.from_user.username or ""
-    if is_vip(u):
-        return True
+    uid = call.from_user.id; u = call.from_user.username or ""
+    if is_vip(u): return True
     if db.is_blocked(str(uid)):
         bot.answer_callback_query(call.id, "🚫 Заблокирована!")
         return False
-    if db.has_access(uid, u):
-        return True
+    if db.has_access(uid, u): return True
     modes[uid] = "normal"
     bot.answer_callback_query(call.id, "🔒 Нет доступа!")
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
-        pass
-    bot.send_message(uid, f"🔒 Нужна подписка!\n\n⭐ {PRICE_STARS} Stars или @tronqx\n\n🎁 Или 3 дня бесплатно!",
-                     reply_markup=access_kb())
+    try: bot.delete_message(call.message.chat.id, call.message.message_id)
+    except: pass
+    bot.send_message(uid, f"🔒 Нужна подписка!\n\n⭐ {PRICE_STARS} Stars или @tronqx\n\n🎁 Или 3 дня бесплатно!", reply_markup=access_kb())
     return False
 
-
 def check_and_count(msg):
-    uid = msg.from_user.id
-    u = msg.from_user.username or ""
-    if not check_access(msg):
-        return False
+    uid = msg.from_user.id; u = msg.from_user.username or ""
+    if not check_access(msg): return False
     ok, count, limit = check_daily_limit(uid, u)
     if not ok:
         plan = (db.get_user(uid) or {}).get("plan", "free")
         if plan == "trial":
-            bot.reply_to(msg, f"⚠️ Лимит пробного: {limit} сообщений/день\n\nКупи полный доступ!",
-                         reply_markup=access_kb())
+            bot.reply_to(msg, f"⚠️ Лимит пробного: {limit} сообщений/день\n\nКупи полный доступ!", reply_markup=access_kb())
         else:
             bot.reply_to(msg, f"⚠️ Лимит {limit}/день исчерпан.")
         return False
@@ -1067,14 +890,16 @@ def check_and_count(msg):
     return True
 
 
-# ── КОМАНДЫ ──
+# ════════════════════════════════════════════════════════
+#  КОМАНДЫ
+# ════════════════════════════════════════════════════════
+
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
-    uid = msg.from_user.id
-    u = msg.from_user.username or ""
-    name = msg.from_user.first_name or "Солнышко"
+    uid = msg.from_user.id; u = msg.from_user.username or ""; name = msg.from_user.first_name or "Солнышко"
     is_new = db.register_user(uid, u, name)
-    histories[uid] = []
+    with _histories_lock:
+        histories[uid] = []
     modes[uid] = "normal"
     db.save_memory(uid, "name", name)
     ref_bonus = ""
@@ -1083,127 +908,90 @@ def cmd_start(msg):
         owner = db.apply_referral(uid, parts[1])
         if owner:
             ref_bonus = "\n🎁 Реферальный бонус применён!"
-            try:
-                bot.send_message(owner, "🎉 По твоей ссылке зарегистрировались! +7 дней 🌸")
-            except:
-                pass
-    if is_new:
-        notify_admin(f"👤 Новый: {uid} @{u} {name}")
+            try: bot.send_message(owner, "🎉 По твоей ссылке зарегистрировались! +7 дней 🌸")
+            except: pass
+    if is_new: notify_admin(f"👤 Новый: {uid} @{u} {name}")
     bot.reply_to(msg,
-                 f"{get_greeting()}, {name}! ✨{ref_bonus}\n\n"
-                 f"Я Лия — твой умный AI-ассистент 👑\n\n"
-                 f"💬 Общаюсь как ChatGPT\n"
-                 f"📸 Решаю задачи по фото\n"
-                 f"📄 Анализирую PDF документы\n"
-                 f"🖼 Генерирую красивые картинки\n"
-                 f"🎤 Расшифровываю голосовые\n"
-                 f"🧮 Математика, физика, код\n\n"
-                 f"Выбери с чего начнём 👇",
-                 reply_markup=main_menu_kb(u))
-
+        f"{get_greeting()}, {name}! ✨{ref_bonus}\n\n"
+        f"Я Лия — твой умный AI-помощник 👑\n\n"
+        f"💬 Общаюсь как ChatGPT\n📸 Решаю задачи по фото\n"
+        f"🖼 Генерирую картинки\n🎤 Расшифровываю голосовые\n"
+        f"🧮 Математика, физика, код\n🌙 Гороскоп, рецепты, переводчик\n\n"
+        f"Выбери с чего начнём 👇",
+        reply_markup=main_menu_kb(u)
+    )
 
 @bot.message_handler(commands=["menu"])
 def cmd_menu(msg):
     db.register_user(msg.from_user.id, msg.from_user.username or "", msg.from_user.first_name or "")
-    bot.reply_to(msg, f"Меню 🌸 | Режим: {mode_name(msg.from_user.id)}",
-                 reply_markup=main_menu_kb(msg.from_user.username or ""))
-
+    bot.reply_to(msg, f"Меню 🌸 | Режим: {mode_name(msg.from_user.id)}", reply_markup=main_menu_kb(msg.from_user.username or ""))
 
 @bot.message_handler(commands=["new"])
 def cmd_new(msg):
     uid = msg.from_user.id
-    histories[uid] = []
+    with _histories_lock:
+        histories[uid] = []
     modes[uid] = "normal"
-    bot.reply_to(msg, "🔄 Начнём с чистого листа! Пиши что угодно 🌸")
-
+    bot.reply_to(msg, "🔄 Начнём с чистого листа! Теперь пиши 🌸")
 
 @bot.message_handler(commands=["status"])
 def cmd_status(msg):
-    uid = msg.from_user.id
-    u = msg.from_user.username or ""
+    uid = msg.from_user.id; u = msg.from_user.username or ""
     has = db.has_access(uid, u)
     sub = db.sub_status(uid)
-    cached = access_cache.get(str(uid))
-    bot.reply_to(msg, f"Статус:\n\nID: {uid}\nДоступ: {has}\nПодписка: {sub}\nКэш: {cached}\nVIP: {is_vip(u)}")
-
+    bot.reply_to(msg, f"ID: {uid}\nДоступ: {has}\nПодписка: {sub}\nVIP: {is_vip(u)}\nAI: Claude {CLAUDE_MODEL}")
 
 @bot.message_handler(commands=["myid"])
-def cmd_myid(msg):
-    bot.reply_to(msg, f"Твой ID: {msg.from_user.id}")
-
+def cmd_myid(msg): bot.reply_to(msg, f"Твой ID: {msg.from_user.id}")
 
 @bot.message_handler(commands=["grant"])
 def cmd_grant(msg):
-    if not is_admin(msg.from_user.username or ""):
-        return
+    if not is_admin(msg.from_user.username or ""): return
     p = msg.text.split()
-    if len(p) < 2:
-        bot.reply_to(msg, "Использование: /grant [id]")
-        return
+    if len(p) < 2: bot.reply_to(msg, "Использование: /grant [id]"); return
     try:
-        t = int(p[1])
-        db.set_user(t, None, plan="forever")
-        db.unblock(t)
+        t = int(p[1]); db.set_user(t, None, plan="forever"); db.unblock(t)
         bot.reply_to(msg, f"✅ Бессрочная выдана {t}")
-        try:
-            bot.send_message(t, "🎉 Тебе выдан бессрочный доступ! /start 🌸")
-        except:
-            pass
-    except:
-        bot.reply_to(msg, "❌ Неверный ID")
-
+        try: bot.send_message(t, "🎉 Тебе выдан бессрочный доступ! /start 🌸")
+        except: pass
+    except: bot.reply_to(msg, "❌ Неверный ID")
 
 @bot.message_handler(commands=["remind"])
 def cmd_remind(msg):
-    if not check_access(msg):
-        return
+    if not check_access(msg): return
     p = msg.text.split(maxsplit=2)
-    if len(p) < 3:
-        bot.reply_to(msg,
-                     "⏰ Формат: /remind 18:00 выпить воду\nЕжедневно: /remind 08:00 зарядка каждый день")
-        return
-    t = p[1]
-    txt = p[2]
-    daily = txt.endswith("каждый день")
-    if daily:
-        txt = txt[:-len("каждый день")].strip()
-    if not re.match(r"^\d{2}:\d{2}$", t):
-        bot.reply_to(msg, "❌ Формат времени: ЧЧ:ММ")
-        return
+    if len(p) < 3: bot.reply_to(msg, "⏰ Формат: /remind 18:00 выпить воду"); return
+    t = p[1]; txt = p[2]; daily = txt.endswith("каждый день")
+    if daily: txt = txt[:-len("каждый день")].strip()
+    if not re.match(r"^\d{2}:\d{2}$", t): bot.reply_to(msg, "❌ Формат времени: ЧЧ:ММ"); return
     db.add_reminder(msg.from_user.id, txt, t, daily=daily)
     bot.reply_to(msg, f"✅ Напоминание:\n⏰ {t}{' 🔁' if daily else ''}\n📝 {txt}")
-
 
 @bot.message_handler(commands=["weather"])
 def cmd_weather(msg):
     p = msg.text.split(maxsplit=1)
-    if len(p) < 2:
-        bot.reply_to(msg, "🌤 Напиши город: /weather Москва")
-        return
-    bot.send_chat_action(msg.chat.id, "typing")
-    bot.reply_to(msg, get_weather(p[1]))
+    if len(p) < 2: bot.reply_to(msg, "🌤 Напиши город: /weather Москва"); return
+    bot.send_chat_action(msg.chat.id, "typing"); bot.reply_to(msg, get_weather(p[1]))
 
 
-# ── ГОЛОСОВЫЕ — С RETRY ──
+# ════════════════════════════════════════════════════════
+#  ОБРАБОТЧИКИ МЕДИА
+# ════════════════════════════════════════════════════════
+
 @bot.message_handler(content_types=["voice"])
 def handle_voice(msg):
     uid = msg.from_user.id
-    if not check_and_count(msg):
-        return
+    if not check_and_count(msg): return
     bot.send_chat_action(msg.chat.id, "typing")
     wait = bot.reply_to(msg, "🎤 Слушаю...")
     try:
         fi = bot.get_file(msg.voice.file_id)
-        audio = requests.get(
-            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}", timeout=20).content
+        audio = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}", timeout=20).content
         text = transcribe_voice(audio)
-        try:
-            bot.delete_message(uid, wait.message_id)
-        except:
-            pass
+        try: bot.delete_message(uid, wait.message_id)
+        except: pass
         if modes.get(uid) == "note_voice_mode":
-            modes[uid] = "normal"
-            db.add_note(uid, text)
+            modes[uid] = "normal"; db.add_note(uid, text)
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("📓 Дневник", callback_data="btn_notes"),
                    types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
@@ -1216,181 +1004,118 @@ def handle_voice(msg):
         send_safe(uid, answer, kb=after_kb())
     except Exception as e:
         log_event(f"Voice error: {e}")
-        try:
-            bot.delete_message(uid, wait.message_id)
-        except:
-            pass
-        bot.reply_to(msg, "😔 Не смогла расшифровать. Попробуй ещё раз или напиши текстом!")
+        try: bot.delete_message(uid, wait.message_id)
+        except: pass
+        bot.reply_to(msg, "😔 Не смогла расшифровать. Попробуй ещё раз!")
 
 
-# ── ФОТО — С GEMINI FALLBACK ──
 @bot.message_handler(content_types=["photo"])
 def handle_photo(msg):
     uid = msg.from_user.id
-    if not check_and_count(msg):
-        return
+    if not check_and_count(msg): return
     bot.send_chat_action(msg.chat.id, "typing")
     wait = None
     try:
         photos = msg.photo
         photo = photos[-2] if len(photos) >= 2 else photos[-1]
         fi = bot.get_file(photo.file_id)
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}"
-        resp = requests.get(file_url, timeout=30)
+        resp = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}", timeout=30)
         if resp.status_code != 200:
             bot.reply_to(msg, "😔 Не смогла скачать фото. Попробуй ещё раз!")
             return
         image_b64 = base64.b64encode(resp.content).decode("utf-8")
         wait = bot.send_message(uid, "📸 Анализирую фото... ⏳")
-        caption = msg.caption or "Внимательно посмотри на фото. Если есть задачи, уравнения, текст — реши пошагово. Пиши без LaTeX."
+        caption = msg.caption or "Внимательно посмотри на фото. Если есть математика, задачи, уравнения, текст — прочитай всё и реши/объясни пошагово. Пиши обычным текстом без LaTeX."
         answer = ask_ai(uid, caption, image_b64=image_b64)
         last_answer[uid] = answer
-        try:
-            bot.delete_message(uid, wait.message_id)
-        except:
-            pass
+        try: bot.delete_message(uid, wait.message_id)
+        except: pass
         send_safe(uid, answer, reply_to=msg, kb=after_kb())
     except Exception as e:
         log_event(f"Photo error: {e}")
         try:
-            if wait:
-                bot.delete_message(uid, wait.message_id)
-        except:
-            pass
+            if wait: bot.delete_message(uid, wait.message_id)
+        except: pass
         bot.reply_to(msg, "😔 Не смогла обработать фото. Напиши задачу текстом — обязательно помогу!")
 
 
-# ══════════════════════════════════════════════
-# НОВОЕ: ОБРАБОТКА PDF ФАЙЛОВ
-# ══════════════════════════════════════════════
-@bot.message_handler(content_types=["document"])
-def handle_document(msg):
-    uid = msg.from_user.id
-    if not check_and_count(msg):
-        return
+# ════════════════════════════════════════════════════════
+#  ПЛАТЁЖНАЯ СИСТЕМА
+# ════════════════════════════════════════════════════════
 
-    doc = msg.document
-    file_name = doc.file_name or ""
-    mime_type = doc.mime_type or ""
-
-    # Проверяем что это PDF
-    if not (file_name.lower().endswith(".pdf") or mime_type == "application/pdf"):
-        bot.reply_to(msg, "📄 Я умею анализировать PDF файлы!\n\nОтправь .pdf документ и я его разберу 🌸")
-        return
-
-    # Проверяем размер (макс 20MB)
-    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-        bot.reply_to(msg, "😔 Файл слишком большой (максимум 20 МБ). Попробуй сжать PDF.")
-        return
-
-    bot.send_chat_action(msg.chat.id, "typing")
-    wait = bot.reply_to(msg, "📄 Читаю документ... ⏳\n\nЭто может занять 10-30 секунд")
-
-    try:
-        fi = bot.get_file(doc.file_id)
-        pdf_bytes = requests.get(
-            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi.file_path}", timeout=60).content
-
-        question = msg.caption or ""
-        answer = analyze_pdf_bytes(pdf_bytes, question)
-
-        try:
-            bot.delete_message(uid, wait.message_id)
-        except:
-            pass
-
-        # Добавляем кнопки
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("❓ Задать вопрос по документу", callback_data="btn_ask_doc"),
-            types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"),
-        )
-        send_safe(uid, f"📄 Анализ документа:\n\n{answer}", reply_to=msg, kb=kb)
-
-        # Сохраняем что пользователь работает с документом
-        modes[uid] = "doc_mode"
-        last_answer[uid] = answer
-
-    except Exception as e:
-        log_event(f"PDF error: {e}")
-        try:
-            bot.delete_message(uid, wait.message_id)
-        except:
-            pass
-        bot.reply_to(msg,
-                     "😔 Не смогла обработать PDF.\n\n"
-                     "Возможные причины:\n"
-                     "• Документ защищён паролем\n"
-                     "• Только сканированные изображения (нет текста)\n"
-                     "• Нужен GEMINI_KEY для лучшей обработки\n\n"
-                     "Попробуй скопировать текст и отправить мне! 🌸")
-
-
-# ── ПЛАТЕЖИ ──
 @bot.pre_checkout_query_handler(func=lambda q: True)
-def pre_checkout(q):
-    bot.answer_pre_checkout_query(q.id, ok=True)
-
+def pre_checkout(q): bot.answer_pre_checkout_query(q.id, ok=True)
 
 @bot.message_handler(content_types=["successful_payment"])
 def successful_payment(msg):
-    uid = msg.from_user.id
-    u = msg.from_user.username or ""
+    uid = msg.from_user.id; u = msg.from_user.username or ""
     stars = msg.successful_payment.total_amount
+
     if stars >= 500:
-        exp = None; plan = "forever"; days_text = "навсегда"
+        exp = None; plan = "forever"; days_text = "навсегда ♾"
     elif stars >= 200:
         exp = datetime.now() + timedelta(days=90); plan = "90days"; days_text = "90 дней"
     else:
         exp = datetime.now() + timedelta(days=30); plan = "30days"; days_text = "30 дней"
+
     db.set_user(uid, exp, plan=plan)
     db.unblock(uid)
-    bot.send_message(uid,
-                     f"🎉 Оплата прошла!\n\n⭐ {stars} Stars\n✅ Подписка: {days_text}\n\nВсе функции открыты! 🌸",
-                     reply_markup=main_menu_kb(u))
-    notify_admin(f"💳 Оплата! {uid} @{u} {stars} Stars {plan}")
+
+    log_event(f"Payment OK: uid={uid} @{u} stars={stars} plan={plan}")
+    notify_admin(f"💳 Оплата! {uid} @{u} {stars} Stars → {plan}")
+
+    bot.send_message(
+        uid,
+        f"🎉 Оплата прошла успешно!\n\n"
+        f"⭐ Списано: {stars} Stars\n"
+        f"✅ Подписка активна: {days_text}\n"
+        f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Все функции открыты! Пиши что угодно 🌸",
+        reply_markup=main_menu_kb(u)
+    )
 
 
-# ── ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ГЕНЕРАЦИИ КАРТИНОК ──
+# ════════════════════════════════════════════════════════
+#  ВНУТРЕННЯЯ ГЕНЕРАЦИЯ КАРТИНОК
+# ════════════════════════════════════════════════════════
+
 def _gen_img(chat_id, uid, prompt):
-    wait = bot.send_message(chat_id, "🎨 Рисую... ⏳ (~30 сек)")
+    """Общая логика генерации и отправки картинки."""
+    wait = bot.send_message(chat_id, "🎨 Рисую... это займёт ~30 секунд ⏳")
     try:
         img_data = generate_image(prompt)
-        try:
-            bot.delete_message(chat_id, wait.message_id)
-        except:
-            pass
+        try: bot.delete_message(chat_id, wait.message_id)
+        except: pass
         if img_data:
             kb = types.InlineKeyboardMarkup(row_width=2)
-            short_p = prompt[:40] if len(prompt) > 40 else prompt
             kb.add(
-                types.InlineKeyboardButton("🔄 Ещё вариант", callback_data=f"imagine_again_{short_p}"),
+                types.InlineKeyboardButton("🔄 Ещё раз", callback_data=f"imagine_again_{prompt[:50]}"),
+                types.InlineKeyboardButton("✍️ Другое", callback_data="imagine_custom"),
                 types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"),
             )
-            bot.send_photo(chat_id, img_data, caption=f"🎨 {prompt[:100]}", reply_markup=kb)
+            bot.send_photo(chat_id, img_data, caption=f"🖼 {prompt[:100]}", reply_markup=kb)
+            last_answer[uid] = f"[Картинка: {prompt}]"
         else:
-            bot.send_message(chat_id, "😔 Не получилось нарисовать. Попробуй другое описание!",
-                             reply_markup=types.InlineKeyboardMarkup().add(
-                                 types.InlineKeyboardButton("🔄 Попробовать снова", callback_data="btn_imagine")))
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"imagine_again_{prompt[:50]}"))
+            bot.send_message(chat_id, "😔 Не смогла нарисовать. Сервис перегружен — попробуй через минуту!", reply_markup=kb)
     except Exception as e:
-        log_event(f"Image gen error: {e}")
-        try:
-            bot.delete_message(chat_id, wait.message_id)
-        except:
-            pass
-        bot.send_message(chat_id, "😔 Ошибка генерации. Попробуй ещё раз!")
+        log_event(f"_gen_img error: {e}")
+        try: bot.delete_message(chat_id, wait.message_id)
+        except: pass
+        bot.send_message(chat_id, "😔 Ошибка при генерации. Попробуй позже!")
 
 
-# ── CALLBACKS ──
+# ════════════════════════════════════════════════════════
+#  CALLBACK ОБРАБОТЧИКИ
+# ════════════════════════════════════════════════════════
+
 @bot.callback_query_handler(func=lambda c: True)
 def handle_callback(call):
-    uid = call.from_user.id
-    data = call.data
-    u = call.from_user.username or ""
+    uid = call.from_user.id; data = call.data; u = call.from_user.username or ""
 
-    FREE_CB = {"btn_menu", "btn_help", "btn_trial", "btn_pay_stars",
-               "pay_stars_30", "pay_stars_90", "pay_stars_forever",
-               "btn_account", "adm_panel", "adm_back"}
+    FREE_CB = {"btn_menu","btn_help","btn_trial","btn_pay_stars",
+               "pay_stars_30","pay_stars_90","pay_stars_forever","btn_account","adm_panel"}
 
     if data not in FREE_CB and not data.startswith("adm_") and not check_access_cb(call):
         return
@@ -1398,29 +1123,26 @@ def handle_callback(call):
     # ── ПРОБНЫЙ ПЕРИОД ──
     if data == "btn_trial":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         if db.get_user(uid):
             bot.send_message(uid, f"У тебя уже есть подписка!\nСтатус: {db.sub_status(uid)}")
             return
         exp = datetime.now() + timedelta(days=TRIAL_DAYS)
         db.set_user(uid, exp, plan="trial")
+        log_event(f"Trial: {uid} @{u}")
         notify_admin(f"🎁 Пробный: {uid} @{u}")
         bot.send_message(uid,
-                         f"🎁 Пробный период активирован!\n\n✅ {TRIAL_DAYS} дня бесплатно\n"
-                         f"📊 Лимит: {FREE_DAILY_LIMIT} сообщений/день\n⏰ До: {exp.strftime('%d.%m.%Y')}\n\n"
-                         f"Теперь все функции доступны! 🌸", reply_markup=main_menu_kb(u))
+            f"🎁 Пробный период активирован!\n\n✅ {TRIAL_DAYS} дня бесплатно\n"
+            f"📊 Лимит: {FREE_DAILY_LIMIT} сообщений/день\n⏰ До: {exp.strftime('%d.%m.%Y')}\n\n"
+            f"Теперь все функции доступны! 🌸", reply_markup=main_menu_kb(u))
         return
 
     # ── ОПЛАТА ──
     if data == "btn_pay_stars":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(
             types.InlineKeyboardButton(f"⭐ {PRICE_STARS} Stars — 30 дней", callback_data="pay_stars_30"),
@@ -1428,15 +1150,13 @@ def handle_callback(call):
             types.InlineKeyboardButton("⭐ 500 Stars — Навсегда", callback_data="pay_stars_forever"),
             types.InlineKeyboardButton("💳 Написать @tronqx", url=PAYMENT_LINK),
         )
-        bot.send_message(uid, "⭐ Выбери план:", reply_markup=kb)
+        bot.send_message(uid, "⭐ Выбери план подписки:", reply_markup=kb)
         return
 
     if data.startswith("pay_stars_"):
         plan_key = data.replace("pay_stars_", "")
         plans = {"30": (PRICE_STARS, "30 дней"), "90": (200, "90 дней"), "forever": (500, "Навсегда")}
-        if plan_key not in plans:
-            bot.answer_callback_query(call.id)
-            return
+        if plan_key not in plans: bot.answer_callback_query(call.id); return
         amount, label = plans[plan_key]
         bot.answer_callback_query(call.id)
         try:
@@ -1451,106 +1171,68 @@ def handle_callback(call):
             log_event(f"Invoice error: {e}")
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("💬 Написать @tronqx", url=PAYMENT_LINK))
-            bot.send_message(uid, f"⭐ {label} — {amount} Stars\n\nНапиши @tronqx: «Подписка {label}, ID: {uid}»",
-                             reply_markup=kb)
+            bot.send_message(uid, f"⭐ {label} — {amount} Stars\n\nНапиши @tronqx: «Подписка {label}, ID: {uid}»", reply_markup=kb)
         return
 
     # ── АККАУНТ ──
     if data == "btn_account":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         st = db.r.get(f"stats:{uid}") or {}
         ref = db.r.get(f"referral:{uid}") or {}
         code = db.get_ref_code(uid)
         link = f"https://t.me/{bot.get_me().username}?start={code}"
         kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(types.InlineKeyboardButton("💳 Подписка", callback_data="btn_pay_stars"),
-               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        kb.add(
+            types.InlineKeyboardButton("💳 Подписка", callback_data="btn_pay_stars"),
+            types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")
+        )
         bot.send_message(uid,
-                         f"📱 Мой аккаунт\n\n🆔 ID: {uid}\n📅 С: {st.get('joined', '?')[:10]}\n"
-                         f"💎 Статус: {db.sub_status(uid)}\n✉️ Сообщений сегодня: {db.get_daily_count(uid)}\n"
-                         f"✉️ Всего: {st.get('total_msgs', 0)}\n\n🔗 Реф. ссылка:\n{link}\n"
-                         f"👥 Приглашено: {len(ref.get('invited', []))}",
-                         reply_markup=kb)
+            f"📱 Мой аккаунт\n\n🆔 ID: {uid}\n📅 С: {st.get('joined','?')[:10]}\n"
+            f"💎 Статус: {db.sub_status(uid)}\n✉️ Сообщений сегодня: {db.get_daily_count(uid)}\n"
+            f"✉️ Всего: {st.get('total_msgs',0)}\n🤖 AI: Claude {CLAUDE_MODEL}\n\n"
+            f"🔗 Реф. ссылка:\n{link}\n👥 Приглашено: {len(ref.get('invited',[]))}",
+            reply_markup=kb)
         return
 
     # ── МЕНЮ ──
     if data == "btn_menu":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        modes[uid] = "normal"  # Сбрасываем режим при возврате в меню
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         bot.send_message(uid, f"Меню 🌸 | Режим: {mode_name(uid)}", reply_markup=main_menu_kb(u))
         return
 
     if data == "btn_new":
-        histories[uid] = []
+        with _histories_lock:
+            histories[uid] = []
         modes[uid] = "normal"
         bot.answer_callback_query(call.id, "🔄 Очищено!")
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         bot.send_message(uid, "🔄 Новый диалог! Пиши что угодно 🌸")
         return
 
     if data == "btn_help":
         bot.answer_callback_query(call.id)
         bot.send_message(uid,
-                         "ℹ️ Помощь:\n\n"
-                         "💬 Пиши любое сообщение\n"
-                         "📸 Отправь фото — решу задачу\n"
-                         "📄 Отправь PDF — проанализирую документ\n"
-                         "🎤 Запиши голосовое — расшифрую\n\n"
-                         "Команды:\n"
-                         "/start — перезапуск\n"
-                         "/new — новый диалог\n"
-                         "/remind 18:00 текст — напоминание\n"
-                         "/weather Москва — погода\n"
-                         "/myid — твой ID",
-                         reply_markup=types.InlineKeyboardMarkup().add(
-                             types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
-        return
-
-    # ── ПОДСКАЗКА PDF ──
-    if data == "btn_pdf_hint":
-        bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        bot.send_message(uid,
-                         "📄 Анализ PDF документов!\n\n"
-                         "Просто отправь мне PDF файл и я:\n\n"
-                         "• 📋 Расскажу о чём документ\n"
-                         "• 🔑 Выделю ключевые моменты\n"
-                         "• 📊 Найду важные данные и цифры\n"
-                         "• 💡 Сделаю выводы\n\n"
-                         "Можешь добавить подпись к файлу с вопросом — отвечу конкретно!\n\n"
-                         "Пример: отправь договор с вопросом «на что обратить внимание?» 🌸",
-                         reply_markup=types.InlineKeyboardMarkup().add(
-                             types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
-        return
-
-    # ── ВОПРОС ПО ДОКУМЕНТУ ──
-    if data == "btn_ask_doc":
-        bot.answer_callback_query(call.id)
-        modes[uid] = "doc_question"
-        bot.send_message(uid, "❓ Задай вопрос по документу:\n\nЧто тебя интересует? Я отвечу на основе загруженного файла.")
+            "ℹ️ Помощь:\n\n💬 Пиши любое сообщение\n📸 Отправь фото — решу задачу\n"
+            "🎤 Запиши голосовое — расшифрую\n\nКоманды:\n/start — перезапуск\n"
+            "/new — новый диалог\n/remind 18:00 текст — напоминание\n"
+            "/weather Москва — погода\n/myid — твой ID",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")
+            ))
         return
 
     # ── РЕЖИМЫ ──
     if data.startswith("mode_"):
-        m = data.replace("mode_", "")
-        modes[uid] = m
-        histories[uid] = []
-        names = {"normal": "💬 Пиши что угодно!", "study": "📚 Помогу с учёбой!",
-                 "support": "🤗 Я здесь 💕", "creative": "🎨 Придумаем что-нибудь! ✨"}
+        m = data.replace("mode_", ""); modes[uid] = m
+        with _histories_lock:
+            histories[uid] = []
+        names = {"normal":"💬 Пиши что угодно!","study":"📚 Помогу с учёбой!",
+                 "support":"🤗 Я здесь 💕","creative":"🎨 Придумаем что-нибудь! ✨"}
         bot.answer_callback_query(call.id, "Режим изменён!")
         bot.send_message(uid, names.get(m, "Режим изменён!"))
         return
@@ -1558,17 +1240,14 @@ def handle_callback(call):
     # ── КАРТИНКИ ──
     if data == "btn_imagine":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
-            types.InlineKeyboardButton("🌅 Закат у моря", callback_data="imagine_q_sunset at sea golden hour"),
-            types.InlineKeyboardButton("🌸 Аниме девушка", callback_data="imagine_q_beautiful anime girl sakura"),
-            types.InlineKeyboardButton("🏙 Ночной город", callback_data="imagine_q_cyberpunk night city neon"),
-            types.InlineKeyboardButton("🐱 Котик", callback_data="imagine_q_cute fluffy cat adorable"),
-            types.InlineKeyboardButton("🌺 Цветочный сад", callback_data="imagine_q_magical flower garden fantasy"),
+            types.InlineKeyboardButton("🌅 Закат у моря", callback_data="imagine_q_sunset at sea golden hour photorealistic"),
+            types.InlineKeyboardButton("🌸 Аниме девушка", callback_data="imagine_q_beautiful anime girl sakura spring"),
+            types.InlineKeyboardButton("🏙 Ночной город", callback_data="imagine_q_night city cyberpunk neon lights"),
+            types.InlineKeyboardButton("🐱 Котик", callback_data="imagine_q_cute fluffy cat adorable soft lighting"),
             types.InlineKeyboardButton("✍️ Своё описание", callback_data="imagine_custom"),
         )
         bot.send_message(uid, "🖼 Выбери стиль или опиши своё:", reply_markup=kb)
@@ -1577,12 +1256,7 @@ def handle_callback(call):
     if data == "imagine_custom":
         bot.answer_callback_query(call.id)
         modes[uid] = "imagine_mode"
-        bot.send_message(uid,
-                         "✍️ Опиши что нарисовать (на русском):\n\n"
-                         "Примеры:\n"
-                         "• красивая девушка в кафе, уютно, осень\n"
-                         "• волшебный лес с феями, ночь, огоньки\n"
-                         "• котик в космосе, акварель")
+        bot.send_message(uid, "✍️ Опиши что нарисовать (на русском):\n\nНапример: красивая девушка в кафе, уютно, осень")
         return
 
     if data.startswith("imagine_q_"):
@@ -1593,193 +1267,282 @@ def handle_callback(call):
 
     if data.startswith("imagine_again_"):
         prompt = data.replace("imagine_again_", "")
-        bot.answer_callback_query(call.id, "🔄 Рисую новый вариант...")
+        bot.answer_callback_query(call.id, "🔄 Перегенерирую...")
         _gen_img(call.message.chat.id, uid, prompt)
         return
 
-    # ── ПОДСКАЗКА ФОТО ──
-    if data == "btn_photo_hint":
+    # ── ADMIN ПАНЕЛЬ ──
+    if data == "adm_panel":
+        if not is_admin(u): bot.answer_callback_query(call.id, "❌ Нет прав"); return
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        bot.send_message(uid,
-                         "📸 Анализ фото!\n\nПросто отправь фото и я:\n\n"
-                         "• Решу задачи и уравнения с фото\n"
-                         "• Прочитаю текст\n"
-                         "• Объясню что на картинке\n"
-                         "• Помогу с домашним заданием\n\n"
-                         "Можешь добавить вопрос в подписи к фото 🌸",
-                         reply_markup=types.InlineKeyboardMarkup().add(
-                             types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        bot.send_message(uid, "👑 Админ-панель:", reply_markup=admin_kb())
         return
 
-    # ── ГОЛОС ПОСЛЕДНЕГО ОТВЕТА ──
-    if data == "btn_voice_last":
-        bot.answer_callback_query(call.id)
-        answer = last_answer.get(uid, "")
-        if not answer:
-            bot.send_message(uid, "😔 Нет текста для озвучки")
-            return
-        if not VOICE_ENABLED:
-            bot.send_message(uid, "😔 Голос временно недоступен")
-            return
+    if data == "adm_stats":
+        if not is_admin(u): bot.answer_callback_query(call.id, "❌"); return
+        bot.answer_callback_query(call.id, "📊 Загружаю...")
         try:
-            bot.send_chat_action(uid, "record_audio")
-            tts = gTTS(text=answer[:500], lang='ru')
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
-                tts.save(f.name)
-                with open(f.name, 'rb') as audio:
-                    bot.send_voice(uid, audio)
-            os.unlink(f.name)
+            a = db.get_analytics()
+            paid_uids = a.get("paid_uids", set())
+
+            # Подсчёт по планам
+            count_active = count_trial = count_forever = 0
+            for uid_str in paid_uids:
+                usr = db.get_user(int(uid_str))
+                if not usr: continue
+                plan = usr.get("plan", "?")
+                exp = usr.get("expires")
+                if plan == "trial": count_trial += 1
+                elif exp is None: count_forever += 1
+                else:
+                    try:
+                        if datetime.fromisoformat(str(exp).strip()) > datetime.now():
+                            count_active += 1
+                    except: pass
+
+            top_text = ""
+            for i, (u_id, st) in enumerate(a.get("top_users", [])[:5], 1):
+                uname = st.get("username", "")
+                name = st.get("name", "")
+                msgs = st.get("total_msgs", 0)
+                label = f"@{uname}" if uname else name or u_id
+                top_text += f"  {i}. {label} — {msgs} сообщ.\n"
+
+            stats_text = (
+                f"📊 Статистика Лия Бот v4.0\n"
+                f"{'─' * 30}\n\n"
+                f"👥 Пользователи:\n"
+                f"  Всего: {a['total_users']}\n"
+                f"  Новых за неделю: {a['new_week']}\n"
+                f"  DAU сегодня: {a['dau_today']}\n"
+                f"  DAU вчера: {a['dau_yest']}\n\n"
+                f"💳 Подписки:\n"
+                f"  Активных платных: {count_active}\n"
+                f"  Пробных: {count_trial}\n"
+                f"  Бессрочных: {count_forever}\n"
+                f"  Заблокировано: {a['blocked']}\n\n"
+                f"💬 Сообщения:\n"
+                f"  Всего: {a['total_msgs']}\n\n"
+                f"🏆 Топ активных:\n{top_text or '  —'}\n"
+                f"🤖 AI модель: {CLAUDE_MODEL}\n"
+                f"⏱ {datetime.now().strftime('%H:%M %d.%m.%Y')}"
+            )
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔙 Панель", callback_data="adm_panel"))
+            bot.send_message(uid, stats_text, reply_markup=kb)
         except Exception as e:
-            log_event(f"TTS error: {e}")
-            bot.send_message(uid, "😔 Не смогла озвучить")
+            bot.send_message(uid, f"❌ Ошибка: {e}")
         return
 
-    # ── ОБЪЯСНЕНИЕ ПРОЩЕ ──
-    if data == "btn_explain_simple":
+    if data == "adm_grant":
+        if not is_admin(u): return
         bot.answer_callback_query(call.id)
-        answer = last_answer.get(uid, "")
-        if not answer:
-            bot.send_message(uid, "😔 Нет текста для упрощения")
-            return
-        bot.send_chat_action(uid, "typing")
-        simple = ask_ai(uid, f"Объясни это максимально просто, как будто объясняешь ребёнку или новичку: {answer[:1000]}",
-                        custom_system=SYSTEM_PROMPT)
-        send_safe(uid, simple, kb=after_kb())
+        modes[uid] = "adm_grant_mode"
+        bot.send_message(uid, "➕ Введи ID пользователя для бессрочного доступа:")
         return
 
-    # ── ПОДРОБНЕЕ ──
-    if data == "btn_elaborate":
+    if data == "adm_grant_time":
+        if not is_admin(u): return
         bot.answer_callback_query(call.id)
-        answer = last_answer.get(uid, "")
-        if not answer:
-            bot.send_message(uid, "😔 Нет текста для расширения")
-            return
+        modes[uid] = "adm_grant_time_mode"
+        bot.send_message(uid, "🕐 Введи ID пользователя для доступа на время:", reply_markup=time_kb())
+        return
+
+    if data == "adm_revoke":
+        if not is_admin(u): return
+        bot.answer_callback_query(call.id)
+        modes[uid] = "adm_revoke_mode"
+        bot.send_message(uid, "❌ Введи ID для отзыва подписки:")
+        return
+
+    if data == "adm_block":
+        if not is_admin(u): return
+        bot.answer_callback_query(call.id)
+        modes[uid] = "adm_block_mode"
+        bot.send_message(uid, "🚫 Введи ID для блокировки:")
+        return
+
+    if data == "adm_unblock":
+        if not is_admin(u): return
+        bot.answer_callback_query(call.id)
+        modes[uid] = "adm_unblock_mode"
+        bot.send_message(uid, "✅ Введи ID для разблокировки:")
+        return
+
+    if data == "adm_broadcast":
+        if not is_admin(u): return
+        bot.answer_callback_query(call.id)
+        modes[uid] = "adm_broadcast_mode"
+        bot.send_message(uid, "📢 Введи текст рассылки всем пользователям:")
+        return
+
+    if data == "adm_users":
+        if not is_admin(u): return
+        bot.answer_callback_query(call.id, "📋 Загружаю...")
+        all_uids = db.r.smembers("all_uids")
+        paid_uids = db.r.smembers("paid_uids")
+        lines = [f"👥 Все пользователи ({len(all_uids)}):\n"]
+        for uid_s in list(all_uids)[:30]:
+            st = db.r.get(f"stats:{uid_s}") or {}
+            uname = st.get("username", "")
+            is_paid = uid_s in paid_uids
+            sub = db.sub_status(int(uid_s))
+            lines.append(f"{'✅' if is_paid else '❌'} {uid_s} @{uname}\n   {sub}")
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Панель", callback_data="adm_panel"))
+        bot.send_message(uid, "\n".join(lines[:50]), reply_markup=kb)
+        return
+
+    if data.startswith("adm_time_"):
+        if not is_admin(u): return
+        parts = data.split("_")
+        days = int(parts[-1])
+        target_uid = parts[-2] if parts[-2] else None
+        if target_uid and target_uid.isdigit():
+            t = int(target_uid)
+            exp = datetime.now() + timedelta(days=days)
+            db.set_user(t, exp, plan=f"{days}days")
+            bot.answer_callback_query(call.id, f"✅ {days} дней выдано!")
+            bot.send_message(uid, f"✅ Пользователю {t} выдано {days} дней до {exp.strftime('%d.%m.%Y')}")
+            try: bot.send_message(t, f"🎉 Тебе выдано {days} дней подписки! Приятного пользования 🌸")
+            except: pass
+        else:
+            bot.answer_callback_query(call.id)
+            modes[uid] = f"adm_time_{days}_mode"
+            bot.send_message(uid, f"🕐 Введи ID пользователя для {days} дней:")
+        return
+
+    # ── ОСТАЛЬНЫЕ КНОПКИ — через AI ──
+    ai_callbacks = {
+        "btn_joke": "Расскажи смешную шутку на русском.",
+        "btn_fact": "Расскажи интересный факт дня.",
+        "btn_motivation": "Дай мощную мотивацию на день.",
+        "btn_compliment": random.choice(COMPLIMENTS) if True else "",
+        "btn_currency": None,  # специальная обработка
+        "btn_weather": None,
+        "btn_horoscope": None,
+        "btn_meditation": None,
+        "btn_photo_hint": "📸 Отправь фото и я его проанализирую или решу задачи с него!",
+        "btn_explain_simple": "Объясни предыдущий ответ более простыми словами, как для ребёнка.",
+        "btn_elaborate": "Расскажи подробнее о предыдущей теме.",
+        "btn_save_note": None,
+        "btn_voice_last": None,
+        "btn_love": None,
+        "btn_beauty": None,
+        "btn_recipe": None,
+        "btn_summarize": None,
+        "btn_translate": None,
+        "btn_mood": None,
+        "btn_planner": None,
+        "btn_todo": None,
+        "btn_reminders": None,
+        "btn_notes": None,
+        "btn_memory": None,
+        "btn_referral": None,
+    }
+
+    # Простые AI-запросы
+    simple_ai = {"btn_joke","btn_fact","btn_motivation"}
+    if data in simple_ai:
+        prompts = {
+            "btn_joke": "Расскажи одну смешную шутку на русском.",
+            "btn_fact": "Расскажи один интересный факт дня.",
+            "btn_motivation": "Дай одну мощную мотивационную цитату на русском с объяснением.",
+        }
+        bot.answer_callback_query(call.id)
         bot.send_chat_action(uid, "typing")
-        elaborate = ask_ai(uid, "Расскажи подробнее об этом, добавь примеры и детали", custom_system=mode_system(uid))
-        send_safe(uid, elaborate, kb=after_kb())
+        try:
+            answer = ask_ai(uid, prompts[data])
+            last_answer[uid] = answer
+            send_safe(uid, answer, kb=after_kb())
+        except Exception as e:
+            log_event(f"Callback AI error {data}: {e}")
+            bot.send_message(uid, "😔 Не смогла ответить. Попробуй ещё раз!")
         return
 
-    # ── СОХРАНИТЬ В ДНЕВНИК ──
-    if data == "btn_save_note":
-        bot.answer_callback_query(call.id, "📓 Сохранено!")
-        answer = last_answer.get(uid, "")
-        if answer:
-            db.add_note(uid, answer[:500])
-            bot.send_message(uid, "📓 Сохранено в дневник! ✨",
-                             reply_markup=types.InlineKeyboardMarkup().add(
-                                 types.InlineKeyboardButton("📓 Открыть дневник", callback_data="btn_notes"),
-                                 types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
+    if data == "btn_compliment":
+        bot.answer_callback_query(call.id)
+        bot.send_message(uid, random.choice(COMPLIMENTS), reply_markup=after_kb())
         return
 
-    # ── ГОРОСКОП ──
+    if data == "btn_currency":
+        bot.answer_callback_query(call.id)
+        bot.send_message(uid, get_currency(), reply_markup=after_kb())
+        return
+
+    if data == "btn_weather":
+        bot.answer_callback_query(call.id)
+        modes[uid] = "weather_mode"
+        bot.send_message(uid, "🌤 Напиши название города:")
+        return
+
     if data == "btn_horoscope":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb = types.InlineKeyboardMarkup(row_width=3)
         for sign in ZODIAC_SIGNS:
-            kb.add(types.InlineKeyboardButton(sign, callback_data=f"horoscope_{sign}"))
+            kb.add(types.InlineKeyboardButton(sign, callback_data=f"horo_{sign}"))
         kb.add(types.InlineKeyboardButton("🔙 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, "🌙 Выбери свой знак зодиака:", reply_markup=kb)
+        bot.send_message(uid, "🌙 Выбери знак зодиака:", reply_markup=kb)
         return
 
-    if data.startswith("horoscope_"):
-        sign = data.replace("horoscope_", "")
+    if data.startswith("horo_"):
+        sign = data.replace("horo_", "")
         bot.answer_callback_query(call.id, "🔮 Составляю...")
         bot.send_chat_action(uid, "typing")
         try:
-            today = datetime.now().strftime("%d %B %Y")
-            answer = ask_ai(uid,
-                            f"Составь подробный гороскоп для знака {sign} на {today}. "
-                            f"Включи: общее, любовь, работу, здоровье, совет дня. "
-                            f"Пиши позитивно, вдохновляюще, с эмодзи.",
-                            custom_system=SYSTEM_PROMPT)
-            last_answer[uid] = answer
-            send_safe(uid, f"🌙 Гороскоп {sign}\n\n{answer}", kb=after_kb())
+            answer = ask_ai(uid, f"Составь подробный гороскоп на сегодня для знака {sign}. Будь позитивной и конкретной.", custom_system=SYSTEM_PROMPT)
+            send_safe(uid, answer, kb=after_kb())
         except Exception as e:
             log_event(f"Horoscope error: {e}")
             bot.send_message(uid, "😔 Не смогла составить гороскоп. Попробуй позже!")
         return
 
-    # ── КРАСОТА И УХОД ──
-    if data == "btn_beauty":
+    if data == "btn_meditation":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        med = random.choice(MEDITATIONS)
         kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("💄 Уход за кожей", callback_data="beauty_skin"),
-            types.InlineKeyboardButton("💅 Маникюр дома", callback_data="beauty_nails"),
-            types.InlineKeyboardButton("💇 Уход за волосами", callback_data="beauty_hair"),
-            types.InlineKeyboardButton("🏋️ Тренировка дома", callback_data="beauty_workout"),
-            types.InlineKeyboardButton("🥗 Здоровое питание", callback_data="beauty_nutrition"),
-            types.InlineKeyboardButton("😴 Уход за собой", callback_data="beauty_selfcare"),
-            types.InlineKeyboardButton("🔙 Меню", callback_data="btn_menu"),
-        )
-        bot.send_message(uid, "💄 Уход за собой — выбери тему:", reply_markup=kb)
+        kb.add(types.InlineKeyboardButton("🧘 Ещё", callback_data="btn_meditation"),
+               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        bot.send_message(uid, f"{med['name']}\n\n{med['text']}", reply_markup=kb)
         return
 
-    if data.startswith("beauty_"):
-        topic = data.replace("beauty_", "")
-        topics = {
-            "skin": "уход за кожей лица: очищение, увлажнение, тонизирование, советы для разных типов кожи",
-            "nails": "маникюр в домашних условиях: пошаговая инструкция, уход за ногтями",
-            "hair": "уход за волосами: маски, питание, защита, советы по типу волос",
-            "workout": "эффективная тренировка дома без оборудования на 20-30 минут",
-            "nutrition": "здоровое питание: основные принципы, что есть для красоты и энергии",
-            "selfcare": "ритуалы самозаботы: вечерний ритуал, психологическое здоровье"
-        }
-        if topic in topics:
-            bot.answer_callback_query(call.id, "💄 Готовлю советы...")
-            bot.send_chat_action(uid, "typing")
-            try:
-                answer = ask_ai(uid, f"Дай подробные советы и рекомендации по теме: {topics[topic]}",
-                                custom_system=SYSTEM_PROMPT)
-                last_answer[uid] = answer
-                send_safe(uid, answer, kb=after_kb())
-            except Exception as e:
-                log_event(f"Beauty error: {e}")
-                bot.send_message(uid, "😔 Ошибка. Попробуй ещё раз!")
-        return
-
-    # ── ЛЮБОВНОЕ ПИСЬМО ──
     if data == "btn_love":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        modes[uid] = "love_letter"
-        bot.send_message(uid, "💌 Напиши кому письмо и немного о ваших отношениях:\n\nНапример: «Письмо парню Максиму, встречаемся 2 года, люблю его юмор и заботу»")
+        modes[uid] = "love_mode"
+        bot.send_message(uid, "💌 Кому написать любовное письмо? Напиши имя или опиши:")
         return
 
-    # ── ПЕРЕСКАЗ ТЕКСТА ──
+    if data == "btn_beauty":
+        bot.answer_callback_query(call.id)
+        bot.send_chat_action(uid, "typing")
+        try:
+            answer = ask_ai(uid, "Дай 5 советов по уходу за собой на сегодня: кожа, волосы, здоровье. Будь конкретной и практичной.", custom_system=SYSTEM_PROMPT)
+            send_safe(uid, answer, kb=after_kb())
+        except Exception as e:
+            log_event(f"Beauty error: {e}")
+            bot.send_message(uid, "😔 Попробуй позже!")
+        return
+
+    if data == "btn_recipe":
+        bot.answer_callback_query(call.id)
+        modes[uid] = "recipe_mode"
+        bot.send_message(uid, "🍽 Что приготовить? Напиши продукты или блюдо:")
+        return
+
     if data == "btn_summarize":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         modes[uid] = "summarize_mode"
-        bot.send_message(uid,
-                         "📖 Пересказ текста!\n\nОтправь мне любой текст — статью, главу книги, новость — и я сделаю краткий пересказ с ключевыми идеями 🌸")
+        bot.send_message(uid, "📖 Вставь текст который нужно пересказать:")
         return
 
-    # ── ПЕРЕВОДЧИК ──
     if data == "btn_translate":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
         kb = types.InlineKeyboardMarkup(row_width=2)
         for lang_name, lang_code in LANGUAGES.items():
             kb.add(types.InlineKeyboardButton(lang_name, callback_data=f"translate_{lang_code}"))
@@ -1789,831 +1552,443 @@ def handle_callback(call):
 
     if data.startswith("translate_"):
         lang = data.replace("translate_", "")
-        modes[uid] = f"translate_{lang}"
         bot.answer_callback_query(call.id)
-        bot.send_message(uid, f"✅ Переводчик на {lang} активирован!\n\nОтправь текст для перевода:")
+        modes[uid] = f"translate_{lang}_mode"
+        bot.send_message(uid, f"🌍 Пиши текст для перевода на {lang}:")
         return
 
-    # ── ВАЛЮТА ──
-    if data == "btn_currency":
-        bot.answer_callback_query(call.id, "💰 Загружаю курс...")
-        bot.send_chat_action(uid, "typing")
-        bot.send_message(uid, get_currency(),
-                         reply_markup=types.InlineKeyboardMarkup().add(
-                             types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
-        return
-
-    # ── ПОГОДА ──
-    if data == "btn_weather":
-        bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        modes[uid] = "weather_mode"
-        bot.send_message(uid, "🌤 Напиши название города:")
-        return
-
-    # ── РЕЦЕПТ ──
-    if data == "btn_recipe":
-        bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        modes[uid] = "recipe_mode"
-        bot.send_message(uid,
-                         "🍽 Рецепт!\n\nНапиши что хочешь приготовить или какие продукты есть в холодильнике:\n\nНапример: «Курица, картошка, лук» или «Что-нибудь быстрое и вкусное»")
-        return
-
-    # ── МЕДИТАЦИЯ ──
-    if data == "btn_meditation":
-        bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        for i, med in enumerate(MEDITATIONS):
-            kb.add(types.InlineKeyboardButton(med["name"], callback_data=f"meditation_{i}"))
-        kb.add(types.InlineKeyboardButton("🎲 Случайная", callback_data="meditation_random"))
-        kb.add(types.InlineKeyboardButton("🔙 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, "🧘 Выбери медитацию:", reply_markup=kb)
-        return
-
-    if data.startswith("meditation_"):
-        idx = data.replace("meditation_", "")
-        bot.answer_callback_query(call.id)
-        if idx == "random":
-            med = random.choice(MEDITATIONS)
-        else:
-            try:
-                med = MEDITATIONS[int(idx)]
-            except:
-                med = random.choice(MEDITATIONS)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("🧘 Ещё медитация", callback_data="btn_meditation"),
-               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, f"{med['name']}\n\n{med['text']}", reply_markup=kb)
-        return
-
-    # ── НАСТРОЕНИЕ ──
     if data == "btn_mood":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         kb = types.InlineKeyboardMarkup(row_width=4)
         for emoji, name in MOOD_EMOJIS.items():
-            kb.add(types.InlineKeyboardButton(f"{emoji} {name}", callback_data=f"mood_{emoji}"))
-        kb.add(types.InlineKeyboardButton("📊 История", callback_data="mood_history"))
-        kb.add(types.InlineKeyboardButton("🔙 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, "📊 Как ты себя чувствуешь сейчас?", reply_markup=kb)
+            kb.add(types.InlineKeyboardButton(f"{emoji} {name}", callback_data=f"mood_{name}"))
+        kb.add(types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        bot.send_message(uid, "📊 Как ты сейчас?", reply_markup=kb)
         return
 
-    if data.startswith("mood_") and data != "mood_history":
-        emoji = data.replace("mood_", "")
-        mood_name = MOOD_EMOJIS.get(emoji, "")
-        today = datetime.now().strftime("%Y-%m-%d %H:%M")
-        if uid not in mood_log:
-            mood_log[uid] = []
-        mood_log[uid].append({"emoji": emoji, "name": mood_name, "time": today})
-        bot.answer_callback_query(call.id, f"Записала {emoji}")
+    if data.startswith("mood_"):
+        mood_name = data.replace("mood_", "")
+        today = datetime.now().strftime("%Y-%m-%d")
+        if uid not in mood_log: mood_log[uid] = {}
+        mood_log[uid][today] = mood_name
+        bot.answer_callback_query(call.id)
         bot.send_chat_action(uid, "typing")
         try:
-            answer = ask_ai(uid,
-                            f"Пользователь отметил настроение: {emoji} {mood_name}. "
-                            f"Отреагируй коротко (2-3 предложения), поддержи или порадуйся вместе.",
-                            custom_system=SYSTEM_PROMPT)
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("📊 Настроение", callback_data="btn_mood"),
-                   types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-            bot.send_message(uid, answer, reply_markup=kb)
-        except:
-            bot.send_message(uid, f"Записала твоё настроение {emoji} {mood_name} ✨")
+            answer = ask_ai(uid, f"Пользователь чувствует себя: {mood_name}. Отреагируй с заботой и предложи что-то полезное.", custom_system=SYSTEM_PROMPT)
+            send_safe(uid, answer, kb=after_kb())
+        except Exception as e:
+            log_event(f"Mood error: {e}")
+            bot.send_message(uid, f"Поняла, ты чувствуешь себя: {mood_name}. Я здесь для тебя! 🌸")
         return
 
-    if data == "mood_history":
-        bot.answer_callback_query(call.id)
-        log = mood_log.get(uid, [])
-        if not log:
-            bot.send_message(uid, "😔 История настроений пока пуста.")
-            return
-        text = "📊 История настроений:\n\n"
-        for entry in log[-10:]:
-            text += f"{entry['emoji']} {entry['name']} — {entry['time']}\n"
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, text, reply_markup=kb)
-        return
-
-    # ── ПЛАНИРОВЩИК ──
     if data == "btn_planner":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         modes[uid] = "planner_mode"
-        bot.send_message(uid,
-                         "🗓 Планировщик!\n\nОпиши свои задачи или цели на день/неделю, и я помогу составить план:\n\nНапример: «Нужно сдать проект, позвонить врачу, убраться дома, сходить в спортзал»")
+        bot.send_message(uid, "🗓 Опиши свои дела или цели — составлю план на день:")
         return
 
-    # ── СПИСОК ДЕЛ ──
     if data == "btn_todo":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        todo = todo_list.get(uid, [])
-        if todo:
-            text = "📝 Список дел:\n\n"
-            for i, item in enumerate(todo, 1):
-                status = "✅" if item.get("done") else "⬜"
-                text += f"{status} {i}. {item['text']}\n"
+        todos = todo_list.get(uid, [])
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(types.InlineKeyboardButton("➕ Добавить дело", callback_data="todo_add"),
+               types.InlineKeyboardButton("🗑 Очистить всё", callback_data="todo_clear"),
+               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        if todos:
+            text = "📝 Список дел:\n\n" + "\n".join([f"{i+1}. {t}" for i, t in enumerate(todos)])
         else:
-            text = "📝 Список дел пуст!\n\nНапиши задачу чтобы добавить:"
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("➕ Добавить", callback_data="todo_add"),
-            types.InlineKeyboardButton("✅ Отметить", callback_data="todo_done"),
-            types.InlineKeyboardButton("🗑 Очистить", callback_data="todo_clear"),
-            types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"),
-        )
+            text = "📝 Список дел пуст. Добавь первое дело!"
         bot.send_message(uid, text, reply_markup=kb)
         return
 
     if data == "todo_add":
         bot.answer_callback_query(call.id)
-        modes[uid] = "todo_add"
-        bot.send_message(uid, "➕ Напиши задачу:")
-        return
-
-    if data == "todo_done":
-        bot.answer_callback_query(call.id)
-        modes[uid] = "todo_done"
-        bot.send_message(uid, "✅ Напиши номер задачи которую выполнила:")
+        modes[uid] = "todo_mode"
+        bot.send_message(uid, "➕ Напиши дело для добавления:")
         return
 
     if data == "todo_clear":
-        bot.answer_callback_query(call.id, "🗑 Очищено!")
         todo_list[uid] = []
-        bot.send_message(uid, "✅ Список очищен!",
-                         reply_markup=types.InlineKeyboardMarkup().add(
-                             types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
+        bot.answer_callback_query(call.id, "🗑 Очищено!")
+        bot.send_message(uid, "🗑 Список дел очищен!", reply_markup=main_menu_kb(u))
         return
 
-    # ── НАПОМИНАНИЯ ──
     if data == "btn_reminders":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         rems = db.get_reminders(uid)
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
         if rems:
-            text = "⏰ Твои напоминания:\n\n"
-            for i, r in enumerate(rems, 1):
-                d = "🔁 " if r.get("daily") else ""
-                text += f"{i}. {d}{r['time']} — {r['text']}\n"
+            text = "⏰ Напоминания:\n\n"
+            for i, r in enumerate(rems):
+                d = "🔁" if r.get("daily") else "📅"
+                text += f"{i+1}. {d} {r['time']} — {r['text']}\n"
+            text += "\n/remind ЧЧ:ММ текст — добавить"
         else:
-            text = "⏰ Напоминаний нет!\n\nИспользуй: /remind 18:00 выпить воду"
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("🗑 Удалить", callback_data="reminder_delete"),
-               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+            text = "⏰ Нет напоминаний.\n\n/remind 18:00 текст — добавить"
         bot.send_message(uid, text, reply_markup=kb)
         return
 
-    if data == "reminder_delete":
-        bot.answer_callback_query(call.id)
-        modes[uid] = "reminder_delete"
-        bot.send_message(uid, "🗑 Напиши номер напоминания для удаления:")
-        return
-
-    # ── ДНЕВНИК ──
     if data == "btn_notes":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         notes = db.get_notes(uid)
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(types.InlineKeyboardButton("➕ Добавить", callback_data="note_add"),
+               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
         if notes:
             text = "📓 Дневник:\n\n"
-            for note in notes[-5:]:
-                date = note.get("date", "")[:10]
-                text += f"📅 {date}\n{note['text'][:200]}{'...' if len(note['text']) > 200 else ''}\n\n"
+            for n in notes[-10:]:
+                date = n.get("date", "")[:10]
+                text += f"📅 {date}\n{n['text']}\n\n"
         else:
-            text = "📓 Дневник пуст!\n\nЗаметки сохраняются автоматически когда ты нажимаешь «В дневник» после ответов."
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("✍️ Добавить заметку", callback_data="note_add"),
-            types.InlineKeyboardButton("🎤 Голосовая заметка", callback_data="note_voice"),
-            types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"),
-        )
-        bot.send_message(uid, text, reply_markup=kb)
+            text = "📓 Дневник пуст. Добавь первую запись!"
+        bot.send_message(uid, text[-4000:], reply_markup=kb)
         return
 
     if data == "note_add":
         bot.answer_callback_query(call.id)
         modes[uid] = "note_mode"
-        bot.send_message(uid, "✍️ Напиши заметку:")
+        bot.send_message(uid, "📓 Напиши запись для дневника:")
         return
 
-    if data == "note_voice":
-        bot.answer_callback_query(call.id)
-        modes[uid] = "note_voice_mode"
-        bot.send_message(uid, "🎤 Отправь голосовое сообщение — сохраню как заметку!")
-        return
-
-    # ── ПАМЯТЬ ──
     if data == "btn_memory":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         mem = db.get_memory(uid)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("✏️ Обновить", callback_data="memory_update"),
+               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
         if mem:
-            text = "🧠 Что я о тебе помню:\n\n"
+            text = "🧠 Что я о тебе знаю:\n\n"
             for k, v in mem.items():
                 text += f"• {k}: {v}\n"
         else:
-            text = "🧠 Я пока ничего не запомнила о тебе!\n\nРасскажи о себе — я запомню."
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("✏️ Имя", callback_data="mem_name"),
-            types.InlineKeyboardButton("🎂 Возраст", callback_data="mem_age"),
-            types.InlineKeyboardButton("🏙 Город", callback_data="mem_city"),
-            types.InlineKeyboardButton("💕 Интересы", callback_data="mem_interests"),
-            types.InlineKeyboardButton("📝 О себе", callback_data="mem_about"),
-            types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"),
-        )
+            text = "🧠 Я пока ничего о тебе не знаю. Расскажи о себе!"
         bot.send_message(uid, text, reply_markup=kb)
         return
 
-    if data.startswith("mem_"):
-        field = data.replace("mem_", "")
+    if data == "memory_update":
         bot.answer_callback_query(call.id)
-        modes[uid] = f"memory_{field}"
-        prompts = {"name": "Как тебя зовут?", "age": "Сколько тебе лет?",
-                   "city": "В каком городе живёшь?", "interests": "Какие у тебя интересы и хобби?",
-                   "about": "Расскажи немного о себе:"}
-        bot.send_message(uid, prompts.get(field, "Напиши:"))
+        modes[uid] = "memory_mode"
+        bot.send_message(uid, "🧠 Расскажи о себе (имя, возраст, город, интересы):")
         return
 
-    # ── РЕФЕРАЛЬНАЯ ПРОГРАММА ──
     if data == "btn_referral":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
         code = db.get_ref_code(uid)
         link = f"https://t.me/{bot.get_me().username}?start={code}"
         ref = db.r.get(f"referral:{uid}") or {}
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
         bot.send_message(uid,
-                         f"🔗 Реферальная программа!\n\n"
-                         f"Поделись ссылкой — получи +7 дней за каждого друга:\n\n"
-                         f"{link}\n\n"
-                         f"👥 Приглашено: {len(ref.get('invited', []))}\n"
-                         f"🎁 Бонусных дней: {ref.get('bonus_days', 0)}",
-                         reply_markup=kb)
+            f"🔗 Реферальная программа!\n\n"
+            f"За каждого приглашённого — +7 дней подписки 🎁\n\n"
+            f"Твоя ссылка:\n{link}\n\n"
+            f"👥 Приглашено: {len(ref.get('invited', []))}\n"
+            f"🎁 Бонус начислено: {ref.get('bonus_days', 0)} дней",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")
+            ))
         return
 
-    # ── РАЗВЛЕЧЕНия ──
-    if data == "btn_joke":
-        bot.answer_callback_query(call.id, "😄 Придумываю...")
-        bot.send_chat_action(uid, "typing")
-        try:
-            joke = ask_ai(uid, "Расскажи смешной анекдот или шутку. Только один, короткий и весёлый.",
-                          custom_system=SYSTEM_PROMPT)
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("😂 Ещё шутку", callback_data="btn_joke"),
-                   types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-            bot.send_message(uid, joke, reply_markup=kb)
-        except:
-            bot.send_message(uid, "😔 Не смогла придумать шутку. Попробуй ещё раз!")
-        return
-
-    if data == "btn_fact":
-        bot.answer_callback_query(call.id, "🌟 Ищу факт...")
-        bot.send_chat_action(uid, "typing")
-        try:
-            fact = ask_ai(uid,
-                          "Расскажи один интересный и неожиданный факт о мире. Сделай его захватывающим!",
-                          custom_system=SYSTEM_PROMPT)
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("🌟 Ещё факт", callback_data="btn_fact"),
-                   types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-            bot.send_message(uid, fact, reply_markup=kb)
-        except:
-            bot.send_message(uid, "😔 Ошибка. Попробуй ещё раз!")
-        return
-
-    if data == "btn_motivation":
-        bot.answer_callback_query(call.id, "💪 Вдохновляю...")
-        bot.send_chat_action(uid, "typing")
-        try:
-            mot = ask_ai(uid,
-                         "Дай мощную мотивационную речь на 3-5 предложений. Искреннюю, не банальную.",
-                         custom_system=SYSTEM_PROMPT)
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("💪 Ещё мотивацию", callback_data="btn_motivation"),
-                   types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-            bot.send_message(uid, mot, reply_markup=kb)
-        except:
-            bot.send_message(uid, "😔 Ошибка. Попробуй ещё раз!")
-        return
-
-    if data == "btn_compliment":
+    if data == "btn_save_note":
         bot.answer_callback_query(call.id)
-        compliment = random.choice(COMPLIMENTS)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("✨ Ещё комплимент", callback_data="btn_compliment"),
-               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, compliment, reply_markup=kb)
-        return
-
-    # ── ВИКТОРИНА ──
-    if data == "btn_quiz":
-        bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        for topic_name in QUIZ_TOPICS.keys():
-            kb.add(types.InlineKeyboardButton(topic_name, callback_data=f"quiz_start_{QUIZ_TOPICS[topic_name]}"))
-        kb.add(types.InlineKeyboardButton("🔙 Меню", callback_data="btn_menu"))
-        bot.send_message(uid, "🧠 Выбери тему викторины:", reply_markup=kb)
-        return
-
-    if data.startswith("quiz_start_"):
-        topic = data.replace("quiz_start_", "")
-        bot.answer_callback_query(call.id, "🧠 Готовлю вопрос...")
-        bot.send_chat_action(uid, "typing")
-        try:
-            question_data = ask_ai(uid,
-                                   f"Придумай вопрос для викторины по теме '{topic}'. "
-                                   f"Формат ответа:\nВОПРОС: [вопрос]\nА) [вариант]\nБ) [вариант]\nВ) [вариант]\nГ) [вариант]\nОТВЕТ: [буква]",
-                                   custom_system=SYSTEM_PROMPT)
-            quiz_state[uid] = {"question": question_data, "topic": topic}
-            kb = types.InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                types.InlineKeyboardButton("А", callback_data="quiz_ans_А"),
-                types.InlineKeyboardButton("Б", callback_data="quiz_ans_Б"),
-                types.InlineKeyboardButton("В", callback_data="quiz_ans_В"),
-                types.InlineKeyboardButton("Г", callback_data="quiz_ans_Г"),
-                types.InlineKeyboardButton("🔙 Другая тема", callback_data="btn_quiz"),
-            )
-            # Показываем только вопрос без ответа
-            q_text = question_data.split("ОТВЕТ:")[0].strip() if "ОТВЕТ:" in question_data else question_data
-            bot.send_message(uid, f"🧠 Вопрос:\n\n{q_text}", reply_markup=kb)
-        except Exception as e:
-            log_event(f"Quiz error: {e}")
-            bot.send_message(uid, "😔 Ошибка генерации вопроса. Попробуй ещё раз!")
-        return
-
-    if data.startswith("quiz_ans_"):
-        answer_letter = data.replace("quiz_ans_", "")
-        bot.answer_callback_query(call.id)
-        state = quiz_state.get(uid)
-        if not state:
-            bot.send_message(uid, "😔 Вопрос устарел. Начни викторину заново!")
-            return
-        q_data = state["question"]
-        correct = ""
-        if "ОТВЕТ:" in q_data:
-            correct = q_data.split("ОТВЕТ:")[-1].strip()[:1].upper()
-        if answer_letter == correct:
-            result = f"✅ Правильно! Молодец! 🎉"
+        if uid in last_answer:
+            db.add_note(uid, last_answer[uid])
+            bot.answer_callback_query(call.id, "📓 Сохранено в дневник!")
         else:
-            result = f"❌ Неправильно. Правильный ответ: {correct}"
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("▶️ Следующий вопрос", callback_data=f"quiz_start_{state['topic']}"),
-            types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"),
-        )
-        bot.send_message(uid, result, reply_markup=kb)
+            bot.answer_callback_query(call.id, "Нечего сохранять")
         return
 
-    # ── ВОПРОС ПО ДОКУМЕНТУ ──
-    if data == "btn_ask_doc":
+    if data == "btn_voice_last":
         bot.answer_callback_query(call.id)
-        modes[uid] = "doc_question"
-        bot.send_message(uid, "❓ Задай вопрос по документу:")
-        return
-
-    # ── АДМИН ──
-    if data == "adm_panel":
-        if not is_admin(u):
-            bot.answer_callback_query(call.id, "⛔ Нет доступа")
+        if uid not in last_answer or not VOICE_ENABLED:
+            bot.answer_callback_query(call.id, "🔇 Голос недоступен")
             return
-        bot.answer_callback_query(call.id)
         try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        bot.send_message(uid, "👑 Админ-панель:", reply_markup=admin_kb())
+            tts = gTTS(last_answer[uid], lang="ru")
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tts.save(f.name)
+                with open(f.name, "rb") as audio_f:
+                    bot.send_voice(uid, audio_f)
+            os.unlink(f.name)
+        except Exception as e:
+            log_event(f"TTS error: {e}")
+            bot.send_message(uid, "😔 Голос временно недоступен")
         return
 
-    if data == "adm_stats":
-        if not is_admin(u):
-            return
+    if data == "btn_explain_simple":
         bot.answer_callback_query(call.id)
-        a = db.get_analytics()
-        text = (f"📊 Аналитика:\n\n"
-                f"👥 Всего: {a['total_users']}\n💎 Платных: {a['paid_users']}\n"
-                f"🚫 Заблок: {a['blocked']}\n📅 DAU сегодня: {a['dau_today']}\n"
-                f"📅 DAU вчера: {a['dau_yest']}\n🆕 Новых (неделя): {a['new_week']}\n"
-                f"✉️ Всего сообщений: {a['total_msgs']}\n\n🏆 Топ-5:\n")
-        for uid_s, st in a['top_users']:
-            text += f"• @{st.get('username', uid_s)}: {st.get('total_msgs', 0)} сообщ.\n"
-        bot.send_message(uid, text, reply_markup=admin_kb())
+        if uid not in last_answer:
+            bot.send_message(uid, "Нечего объяснять — задай вопрос сначала!")
+            return
+        bot.send_chat_action(uid, "typing")
+        try:
+            answer = ask_ai(uid, "Объясни предыдущий ответ ещё проще, как для 10-летнего ребёнка.")
+            last_answer[uid] = answer
+            send_safe(uid, answer, kb=after_kb())
+        except Exception as e:
+            log_event(f"Explain simple error: {e}")
+            bot.send_message(uid, "😔 Попробуй ещё раз!")
         return
 
-    if data == "adm_grant":
-        if not is_admin(u):
-            return
+    if data == "btn_elaborate":
         bot.answer_callback_query(call.id)
-        modes[uid] = "adm_grant"
-        bot.send_message(uid, "➕ Введи ID пользователя для бессрочного доступа:")
-        return
-
-    if data == "adm_grant_time":
-        if not is_admin(u):
+        if uid not in last_answer:
+            bot.send_message(uid, "Нечего расширять — задай вопрос сначала!")
             return
-        bot.answer_callback_query(call.id)
-        modes[uid] = "adm_grant_time_wait"
-        bot.send_message(uid, "🕐 Введи ID пользователя:")
+        bot.send_chat_action(uid, "typing")
+        try:
+            answer = ask_ai(uid, "Расскажи подробнее о предыдущей теме. Добавь примеры, детали, интересные факты.")
+            last_answer[uid] = answer
+            send_safe(uid, answer, kb=after_kb())
+        except Exception as e:
+            log_event(f"Elaborate error: {e}")
+            bot.send_message(uid, "😔 Попробуй ещё раз!")
         return
 
-    if data == "adm_revoke":
-        if not is_admin(u):
-            return
-        bot.answer_callback_query(call.id)
-        modes[uid] = "adm_revoke"
-        bot.send_message(uid, "❌ Введи ID для отзыва доступа:")
-        return
-
-    if data == "adm_block":
-        if not is_admin(u):
-            return
-        bot.answer_callback_query(call.id)
-        modes[uid] = "adm_block"
-        bot.send_message(uid, "🚫 Введи ID для блокировки:")
-        return
-
-    if data == "adm_unblock":
-        if not is_admin(u):
-            return
-        bot.answer_callback_query(call.id)
-        modes[uid] = "adm_unblock"
-        bot.send_message(uid, "✅ Введи ID для разблокировки:")
-        return
-
-    if data == "adm_broadcast":
-        if not is_admin(u):
-            return
-        bot.answer_callback_query(call.id)
-        modes[uid] = "adm_broadcast"
-        bot.send_message(uid, "📢 Введи текст рассылки:")
-        return
-
-    if data == "adm_users":
-        if not is_admin(u):
-            return
-        bot.answer_callback_query(call.id)
-        all_uids = db.r.smembers("all_uids")
-        paid = db.r.smembers("paid_uids")
-        text = f"👥 Пользователи ({len(all_uids)}):\n\n"
-        count = 0
-        for uid_s in list(all_uids)[:20]:
-            st = db.r.get(f"stats:{uid_s}") or {}
-            paid_mark = "💎" if uid_s in paid else "👤"
-            text += f"{paid_mark} {uid_s} @{st.get('username', '?')} | {st.get('total_msgs', 0)}msg\n"
-            count += 1
-        if len(all_uids) > 20:
-            text += f"\n...и ещё {len(all_uids) - 20}"
-        bot.send_message(uid, text, reply_markup=admin_kb())
-        return
-
-    if data.startswith("adm_time_"):
-        if not is_admin(u):
-            return
-        parts = data.split("_")
-        if len(parts) >= 4:
-            target_uid = parts[2]
-            days = int(parts[3]) if parts[3].isdigit() else 7
-            try:
-                t = int(target_uid)
-                exp = datetime.now() + timedelta(days=days)
-                db.set_user(t, exp, plan=f"{days}days")
-                db.unblock(t)
-                bot.answer_callback_query(call.id, f"✅ {days} дней выдано!")
-                bot.send_message(uid, f"✅ Пользователю {t} выдано {days} дней до {exp.strftime('%d.%m.%Y')}",
-                                 reply_markup=admin_kb())
-                try:
-                    bot.send_message(t, f"🎉 Тебе открыт доступ на {days} дней! /start 🌸")
-                except:
-                    pass
-            except Exception as e:
-                bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
-        return
+    bot.answer_callback_query(call.id)
 
 
-# ── ТЕКСТОВЫЕ СООБЩЕНИЯ ──
+# ════════════════════════════════════════════════════════
+#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
+# ════════════════════════════════════════════════════════
+
 @bot.message_handler(content_types=["text"])
 def handle_text(msg):
-    uid = msg.from_user.id
-    u = msg.from_user.username or ""
-    text = msg.text.strip()
-    m = modes.get(uid, "normal")
+    uid = msg.from_user.id; text = msg.text.strip(); u = msg.from_user.username or ""
 
-    # Регистрируем пользователя
     db.register_user(uid, u, msg.from_user.first_name or "")
 
     # ── РЕЖИМЫ ВВОДА ──
+    mode = modes.get(uid, "normal")
 
-    # Режим генерации картинки
-    if m == "imagine_mode":
-        if not check_and_count(msg):
-            return
+    if mode == "weather_mode":
         modes[uid] = "normal"
         bot.send_chat_action(uid, "typing")
+        bot.reply_to(msg, get_weather(text))
+        return
+
+    if mode == "imagine_mode":
+        if not check_and_count(msg): return
+        modes[uid] = "normal"
         _gen_img(msg.chat.id, uid, text)
         return
 
-    # Режим погоды
-    if m == "weather_mode":
-        if not check_and_count(msg):
-            return
-        modes[uid] = "normal"
-        bot.send_chat_action(uid, "typing")
-        bot.reply_to(msg, get_weather(text),
-                     reply_markup=types.InlineKeyboardMarkup().add(
-                         types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
-        return
-
-    # Режим рецепта
-    if m == "recipe_mode":
-        if not check_and_count(msg):
-            return
+    if mode == "love_mode":
+        if not check_and_count(msg): return
         modes[uid] = "normal"
         bot.send_chat_action(uid, "typing")
         try:
-            answer = ask_ai(uid, f"Придумай вкусный рецепт с этими продуктами или по этому запросу: {text}. "
-                                 f"Напиши: название блюда, ингредиенты, пошаговый рецепт, время приготовления.",
-                            custom_system=SYSTEM_PROMPT)
+            answer = ask_ai(uid, f"Напиши красивое любовное письмо для {text}. Романтично, нежно, искренне.", custom_system=SYSTEM_PROMPT)
             last_answer[uid] = answer
-            send_safe(uid, answer, reply_to=msg, kb=after_kb())
+            send_safe(uid, answer, kb=after_kb())
+        except Exception as e:
+            log_event(f"Love mode error: {e}")
+            bot.reply_to(msg, "😔 Попробуй ещё раз!")
+        return
+
+    if mode == "recipe_mode":
+        if not check_and_count(msg): return
+        modes[uid] = "normal"
+        bot.send_chat_action(uid, "typing")
+        try:
+            answer = ask_ai(uid, f"Дай подробный рецепт: {text}. Ингредиенты и пошаговое приготовление.", custom_system=SYSTEM_PROMPT)
+            last_answer[uid] = answer
+            send_safe(uid, answer, kb=after_kb())
         except Exception as e:
             log_event(f"Recipe error: {e}")
-            bot.reply_to(msg, "😔 Ошибка. Попробуй ещё раз!")
+            bot.reply_to(msg, "😔 Попробуй ещё раз!")
         return
 
-    # Режим перевода
-    if m.startswith("translate_"):
-        if not check_and_count(msg):
-            return
-        lang = m.replace("translate_", "")
-        bot.send_chat_action(uid, "typing")
-        try:
-            answer = ask_ai(uid, f"Переведи на {lang}. Только перевод, без пояснений: {text}",
-                            custom_system=SYSTEM_PROMPT)
-            last_answer[uid] = answer
-            kb = types.InlineKeyboardMarkup(row_width=2)
-            kb.add(types.InlineKeyboardButton("🌍 Другой язык", callback_data="btn_translate"),
-                   types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-            send_safe(uid, answer, reply_to=msg, kb=kb)
-        except Exception as e:
-            log_event(f"Translate error: {e}")
-            bot.reply_to(msg, "😔 Ошибка перевода. Попробуй ещё раз!")
-        return
-
-    # Режим пересказа
-    if m == "summarize_mode":
-        if not check_and_count(msg):
-            return
+    if mode == "summarize_mode":
+        if not check_and_count(msg): return
         modes[uid] = "normal"
         bot.send_chat_action(uid, "typing")
         try:
-            answer = ask_ai(uid, f"Сделай краткий пересказ этого текста. "
-                                 f"Выдели основные идеи, ключевые факты, главный вывод:\n\n{text}",
-                            custom_system=SYSTEM_PROMPT)
+            answer = ask_ai(uid, f"Сделай краткий пересказ этого текста на русском:\n\n{text}", custom_system=SYSTEM_PROMPT)
             last_answer[uid] = answer
-            send_safe(uid, answer, reply_to=msg, kb=after_kb())
+            send_safe(uid, answer, kb=after_kb())
         except Exception as e:
             log_event(f"Summarize error: {e}")
-            bot.reply_to(msg, "😔 Ошибка. Попробуй ещё раз!")
+            bot.reply_to(msg, "😔 Попробуй ещё раз!")
         return
 
-    # Режим любовного письма
-    if m == "love_letter":
-        if not check_and_count(msg):
-            return
+    if mode and mode.startswith("translate_") and mode.endswith("_mode"):
+        if not check_and_count(msg): return
+        lang = mode.replace("translate_", "").replace("_mode", "")
         modes[uid] = "normal"
         bot.send_chat_action(uid, "typing")
         try:
-            answer = ask_ai(uid, f"Напиши красивое любовное письмо. Информация: {text}. "
-                                 f"Письмо должно быть искренним, нежным, с эмоциями.",
-                            custom_system=SYSTEM_PROMPT)
+            answer = ask_ai(uid, f"Переведи на {lang}:\n\n{text}", custom_system=SYSTEM_PROMPT)
             last_answer[uid] = answer
-            send_safe(uid, answer, reply_to=msg, kb=after_kb())
+            send_safe(uid, answer, kb=after_kb())
         except Exception as e:
-            log_event(f"Love letter error: {e}")
-            bot.reply_to(msg, "😔 Ошибка. Попробуй ещё раз!")
+            log_event(f"Translate error: {e}")
+            bot.reply_to(msg, "😔 Попробуй ещё раз!")
         return
 
-    # Режим заметки
-    if m == "note_mode":
-        modes[uid] = "normal"
-        db.add_note(uid, text)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("📓 Дневник", callback_data="btn_notes"),
-               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
-        bot.reply_to(msg, "📓 Заметка сохранена! ✨", reply_markup=kb)
-        return
-
-    # Режим планировщика
-    if m == "planner_mode":
-        if not check_and_count(msg):
-            return
+    if mode == "planner_mode":
+        if not check_and_count(msg): return
         modes[uid] = "normal"
         bot.send_chat_action(uid, "typing")
         try:
-            answer = ask_ai(uid, f"Помоги составить план. Задачи/цели: {text}. "
-                                 f"Расставь приоритеты, предложи порядок выполнения, дай временные рамки.",
-                            custom_system=SYSTEM_PROMPT)
+            answer = ask_ai(uid, f"Составь детальный план дня на основе: {text}. Разбей по времени, добавь советы по продуктивности.", custom_system=SYSTEM_PROMPT)
             last_answer[uid] = answer
-            send_safe(uid, answer, reply_to=msg, kb=after_kb())
+            send_safe(uid, answer, kb=after_kb())
         except Exception as e:
             log_event(f"Planner error: {e}")
-            bot.reply_to(msg, "😔 Ошибка. Попробуй ещё раз!")
+            bot.reply_to(msg, "😔 Попробуй ещё раз!")
         return
 
-    # Режим Todo: добавить
-    if m == "todo_add":
+    if mode == "todo_mode":
+        todo_list.setdefault(uid, []).append(text)
         modes[uid] = "normal"
-        if uid not in todo_list:
-            todo_list[uid] = []
-        todo_list[uid].append({"text": text, "done": False})
-        bot.reply_to(msg, f"✅ Добавлено: {text}",
-                     reply_markup=types.InlineKeyboardMarkup().add(
-                         types.InlineKeyboardButton("📝 Список дел", callback_data="btn_todo"),
-                         types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(types.InlineKeyboardButton("📝 Список", callback_data="btn_todo"),
+               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        bot.reply_to(msg, f"✅ Добавлено: {text}", reply_markup=kb)
         return
 
-    # Режим Todo: отметить выполненным
-    if m == "todo_done":
+    if mode == "note_mode":
+        db.add_note(uid, text)
         modes[uid] = "normal"
-        try:
-            idx = int(text) - 1
-            todo = todo_list.get(uid, [])
-            if 0 <= idx < len(todo):
-                todo[idx]["done"] = True
-                bot.reply_to(msg, f"✅ Отмечено: {todo[idx]['text']}",
-                             reply_markup=types.InlineKeyboardMarkup().add(
-                                 types.InlineKeyboardButton("📝 Список дел", callback_data="btn_todo")))
-            else:
-                bot.reply_to(msg, "❌ Неверный номер")
-        except:
-            bot.reply_to(msg, "❌ Напиши номер задачи (цифру)")
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(types.InlineKeyboardButton("📓 Дневник", callback_data="btn_notes"),
+               types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu"))
+        bot.reply_to(msg, "📓 Запись сохранена!", reply_markup=kb)
         return
 
-    # Режим удаления напоминания
-    if m == "reminder_delete":
+    if mode == "memory_mode":
         modes[uid] = "normal"
-        try:
-            idx = int(text) - 1
-            db.remove_reminder(uid, idx)
-            bot.reply_to(msg, "✅ Напоминание удалено!",
-                         reply_markup=types.InlineKeyboardMarkup().add(
-                             types.InlineKeyboardButton("⏰ Напоминания", callback_data="btn_reminders"),
-                             types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
-        except:
-            bot.reply_to(msg, "❌ Неверный номер")
-        return
-
-    # Режим памяти
-    if m.startswith("memory_"):
-        field = m.replace("memory_", "")
-        modes[uid] = "normal"
-        db.save_memory(uid, field, text)
-        bot.reply_to(msg, f"🧠 Запомнила: {field} = {text} ✨",
-                     reply_markup=types.InlineKeyboardMarkup().add(
-                         types.InlineKeyboardButton("🧠 Память", callback_data="btn_memory"),
-                         types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")))
-        return
-
-    # Режим вопроса по документу
-    if m == "doc_question":
-        if not check_and_count(msg):
-            return
         bot.send_chat_action(uid, "typing")
-        doc_context = last_answer.get(uid, "")
         try:
-            answer = ask_ai(uid,
-                            f"На основе этого документа:\n{doc_context[:2000]}\n\nОтветь на вопрос: {text}",
-                            custom_system=SYSTEM_PROMPT)
-            last_answer[uid] = answer
-            send_safe(uid, answer, reply_to=msg, kb=after_kb())
+            extracted = ask_claude_raw(
+                [{"role": "user", "content": f"Из текста извлеки данные о пользователе. Верни ТОЛЬКО JSON: {{\"name\":\"...\",\"age\":\"...\",\"city\":\"...\",\"interests\":\"...\",\"about\":\"...\"}}. Если поле не упомянуто — не включай его. Текст: {text}"}],
+                system="Ты извлекаешь данные из текста и возвращаешь только JSON.",
+                max_tokens=200
+            )
+            try:
+                data_json = json.loads(extracted)
+                for k, v in data_json.items():
+                    if v: db.save_memory(uid, k, v)
+                bot.reply_to(msg, "🧠 Запомнила! Теперь буду обращаться персонально 🌸",
+                             reply_markup=types.InlineKeyboardMarkup().add(
+                                 types.InlineKeyboardButton("📋 Меню", callback_data="btn_menu")
+                             ))
+            except:
+                db.save_memory(uid, "about", text)
+                bot.reply_to(msg, "🧠 Сохранила информацию о тебе! 🌸")
         except Exception as e:
-            log_event(f"Doc question error: {e}")
-            bot.reply_to(msg, "😔 Ошибка. Попробуй ещё раз!")
+            log_event(f"Memory mode error: {e}")
+            bot.reply_to(msg, "😔 Попробуй ещё раз!")
         return
 
     # ── ADMIN РЕЖИМЫ ──
-    if m == "adm_grant" and is_admin(u):
+    if mode == "adm_grant_mode" and is_admin(u):
+        modes[uid] = "normal"
+        try:
+            t = int(text.strip()); db.set_user(t, None, plan="forever"); db.unblock(t)
+            bot.reply_to(msg, f"✅ Бессрочная выдана: {t}")
+            try: bot.send_message(t, "🎉 Тебе выдан бессрочный доступ к Лие! /start 🌸")
+            except: pass
+        except: bot.reply_to(msg, "❌ Неверный ID")
+        return
+
+    if mode == "adm_revoke_mode" and is_admin(u):
+        modes[uid] = "normal"
+        try:
+            t = int(text.strip()); db.remove_user(t)
+            bot.reply_to(msg, f"✅ Подписка отозвана: {t}")
+        except: bot.reply_to(msg, "❌ Неверный ID")
+        return
+
+    if mode == "adm_block_mode" and is_admin(u):
+        modes[uid] = "normal"
+        try:
+            t = int(text.strip()); db.block(t)
+            bot.reply_to(msg, f"🚫 Заблокирован: {t}")
+        except: bot.reply_to(msg, "❌ Неверный ID")
+        return
+
+    if mode == "adm_unblock_mode" and is_admin(u):
+        modes[uid] = "normal"
+        try:
+            t = int(text.strip()); db.unblock(t)
+            bot.reply_to(msg, f"✅ Разблокирован: {t}")
+        except: bot.reply_to(msg, "❌ Неверный ID")
+        return
+
+    if mode and mode.startswith("adm_time_") and mode.endswith("_mode") and is_admin(u):
+        days = int(mode.split("_")[2])
         modes[uid] = "normal"
         try:
             t = int(text.strip())
-            db.set_user(t, None, plan="forever")
-            db.unblock(t)
-            bot.reply_to(msg, f"✅ Бессрочная выдана {t}")
-            try:
-                bot.send_message(t, "🎉 Тебе выдан бессрочный доступ! /start 🌸")
-            except:
-                pass
-        except:
-            bot.reply_to(msg, "❌ Неверный ID")
+            exp = datetime.now() + timedelta(days=days)
+            db.set_user(t, exp, plan=f"{days}days")
+            bot.reply_to(msg, f"✅ {t} → {days} дней до {exp.strftime('%d.%m.%Y')}")
+            try: bot.send_message(t, f"🎉 Тебе выдано {days} дней подписки Лия! 🌸")
+            except: pass
+        except: bot.reply_to(msg, "❌ Неверный ID")
         return
 
-    if m == "adm_grant_time_wait" and is_admin(u):
-        try:
-            t = int(text.strip())
-            modes[uid] = f"adm_time_{t}"
-            bot.reply_to(msg, f"На сколько дней? Выбери:", reply_markup=time_kb(str(t)))
-        except:
-            modes[uid] = "normal"
-            bot.reply_to(msg, "❌ Неверный ID")
-        return
-
-    if m == "adm_revoke" and is_admin(u):
-        modes[uid] = "normal"
-        try:
-            t = int(text.strip())
-            db.remove_user(t)
-            bot.reply_to(msg, f"✅ Доступ отозван у {t}")
-        except:
-            bot.reply_to(msg, "❌ Неверный ID")
-        return
-
-    if m == "adm_block" and is_admin(u):
-        modes[uid] = "normal"
-        try:
-            t = int(text.strip())
-            db.block(t)
-            bot.reply_to(msg, f"🚫 Пользователь {t} заблокирован")
-        except:
-            bot.reply_to(msg, "❌ Неверный ID")
-        return
-
-    if m == "adm_unblock" and is_admin(u):
-        modes[uid] = "normal"
-        try:
-            t = int(text.strip())
-            db.unblock(t)
-            bot.reply_to(msg, f"✅ Пользователь {t} разблокирован")
-        except:
-            bot.reply_to(msg, "❌ Неверный ID")
-        return
-
-    if m == "adm_broadcast" and is_admin(u):
+    if mode == "adm_broadcast_mode" and is_admin(u):
         modes[uid] = "normal"
         all_uids = db.r.smembers("all_uids")
-        sent = failed = 0
-        for target_uid in all_uids:
+        bot.reply_to(msg, f"📢 Рассылка запущена ({len(all_uids)} получателей)...")
+
+        def _do_broadcast(text_to_send, uids, admin_uid):
+            sent = failed = 0
+            for uid_str in uids:
+                try:
+                    bot.send_message(int(uid_str), f"📢 Сообщение от Лии:\n\n{text_to_send}")
+                    sent += 1
+                    time.sleep(0.05)
+                except Exception:
+                    failed += 1
             try:
-                bot.send_message(int(target_uid), f"📢 {text}")
-                sent += 1
-                time.sleep(0.05)
-            except:
-                failed += 1
-        bot.reply_to(msg, f"📢 Рассылка: отправлено {sent}, ошибок {failed}", reply_markup=admin_kb())
+                bot.send_message(admin_uid, f"📢 Рассылка завершена!\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
+            except Exception:
+                pass
+
+        threading.Thread(target=_do_broadcast, args=(text, list(all_uids), uid), daemon=True).start()
         return
 
     # ── ОБЫЧНЫЙ ЧАТ ──
-    if not check_and_count(msg):
-        return
+    if not check_and_count(msg): return
 
     bot.send_chat_action(uid, "typing")
+    wait = None
+
     try:
+        # Для длинных запросов показываем индикатор
+        if len(text) > 100:
+            wait = bot.reply_to(msg, "⌛ Думаю...")
+
         answer = ask_ai(uid, text)
         last_answer[uid] = answer
+
+        if wait:
+            try: bot.delete_message(uid, wait.message_id)
+            except: pass
+
         send_safe(uid, answer, reply_to=msg, kb=after_kb())
+
     except Exception as e:
-        log_event(f"Text error: {e}")
+        log_event(f"Text handler error uid={uid}: {e}")
+        if wait:
+            try: bot.delete_message(uid, wait.message_id)
+            except: pass
         bot.reply_to(msg,
-                     "😔 Что-то пошло не так. Попробуй:\n• Написать ещё раз\n• /new — начать новый диалог\n• Подождать немного")
+            "😔 Что-то пошло не так. Попробуй:\n\n"
+            "• /new — начать новый диалог\n"
+            "• Повторить вопрос\n"
+            "• Написать позже"
+        )
 
 
-# ── ЗАПУСК ──
-log_event("Liya v4.0 starting...")
-print("🌸 Liya v4.0 запускается...")
-bot.infinity_polling(timeout=60, long_polling_timeout=30)
+# ════════════════════════════════════════════════════════
+#  ЗАПУСК
+# ════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    log_event(f"Liya bot v4.0 started | Claude: {CLAUDE_MODEL}")
+    print(f"✅ Liya v4.0 | Claude API | Bot started")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
